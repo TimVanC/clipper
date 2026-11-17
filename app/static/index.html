@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Clipper</title>
+<style>
+  :root { --bg:#0f1115; --card:#181b22; --line:#262a33; --txt:#e8eaf0; --mut:#8b93a5; --acc:#7c5cff;
+          --ok:#2ecc71; --bad:#ff5d5d; --warn:#f5a623; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:15px/1.4 -apple-system,system-ui,Segoe UI,Roboto,sans-serif;
+         padding-bottom:70px; }
+  header { position:sticky; top:0; z-index:5; background:var(--bg); border-bottom:1px solid var(--line);
+           padding:12px 14px; display:flex; align-items:center; gap:10px; }
+  header h1 { font-size:17px; margin:0; flex:1; }
+  .pill { font-size:12px; padding:3px 8px; border-radius:99px; background:var(--card); border:1px solid var(--line); color:var(--mut); }
+  .pill.on { color:var(--ok); border-color:var(--ok); } .pill.off { color:var(--bad); border-color:var(--bad); }
+  nav { position:fixed; bottom:0; left:0; right:0; display:flex; background:var(--card); border-top:1px solid var(--line);
+        padding-bottom:env(safe-area-inset-bottom); z-index:5; }
+  nav button { flex:1; padding:12px 4px; background:none; border:0; color:var(--mut); font-size:13px; }
+  nav button.active { color:var(--txt); border-top:2px solid var(--acc); }
+  nav .badge { background:var(--acc); color:#fff; border-radius:99px; padding:1px 6px; font-size:11px; margin-left:4px; }
+  main { padding:12px; max-width:900px; margin:0 auto; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px; margin-bottom:12px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .grow { flex:1; min-width:0; }
+  h2 { font-size:14px; color:var(--mut); text-transform:uppercase; letter-spacing:.06em; margin:18px 0 8px; }
+  input, select, textarea { background:#0f1115; color:var(--txt); border:1px solid var(--line); border-radius:8px;
+          padding:10px; font:inherit; width:100%; }
+  textarea { min-height:64px; resize:vertical; }
+  label { display:block; font-size:12px; color:var(--mut); margin:8px 0 3px; }
+  button.btn { background:var(--acc); color:#fff; border:0; border-radius:8px; padding:10px 14px; font:inherit; font-weight:600; }
+  button.btn.ok { background:var(--ok); color:#06210f; } button.btn.bad { background:#3a2226; color:var(--bad); }
+  button.btn.ghost { background:#222633; color:var(--txt); } button.btn:disabled { opacity:.5; }
+  video { width:100%; max-height:70vh; border-radius:10px; background:#000; }
+  .mut { color:var(--mut); font-size:13px; } .dot { width:9px; height:9px; border-radius:50%; display:inline-block; margin-right:6px; }
+  .dot.live { background:var(--bad); box-shadow:0 0 8px var(--bad); } .dot.idle { background:#444; }
+  .clip.hl { outline:2px solid var(--acc); }
+  .tag { font-size:11px; padding:2px 7px; border-radius:6px; background:#222633; color:var(--mut); }
+  a.btn { background:var(--acc); color:#fff; border-radius:8px; padding:10px 14px; font-weight:600;
+          text-decoration:none; display:inline-block; text-align:center; }
+  a.btn.ghost { background:#222633; color:var(--txt); }
+  .tag.posted, .tag.approved { color:var(--ok); } .tag.failed { color:var(--bad); } .tag.posting { color:var(--warn); }
+  .err { color:var(--bad); font-size:13px; margin-top:6px; }
+  .accts label { display:flex; align-items:center; gap:8px; color:var(--txt); font-size:14px; margin:4px 0; }
+  .accts input { width:auto; }
+  .toast { position:fixed; left:12px; right:12px; bottom:76px; background:#222633; border:1px solid var(--line);
+           padding:10px 12px; border-radius:10px; z-index:9; display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎬 Clipper</h1>
+  <span id="pill-live" class="pill">0 live</span>
+  <span id="pill-cfg" class="pill">…</span>
+</header>
+<main id="main"></main>
+<nav>
+  <button data-tab="review" class="active">Review<span id="b-review" class="badge" hidden></span></button>
+  <button data-tab="live">Live</button>
+  <button data-tab="history">History</button>
+  <button data-tab="settings">Settings</button>
+</nav>
+<div id="toast" class="toast"></div>
+
+<script>
+const $ = (s, el=document) => el.querySelector(s);
+let state = null, accounts = null, tab = 'review', clips = [], highlight = null, editing = false;
+
+async function api(path, opts={}) {
+  const r = await fetch(path, {headers:{'Content-Type':'application/json'}, ...opts,
+                               body: opts.body ? JSON.stringify(opts.body) : undefined});
+  if (!r.ok) { let m = r.statusText; try { m = (await r.json()).detail || m; } catch(e){} throw new Error(m); }
+  return r.json();
+}
+function toast(msg) { const t=$('#toast'); t.textContent=msg; t.style.display='block'; setTimeout(()=>t.style.display='none', 3500); }
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const ago = ts => { if(!ts) return 'never'; const s=Math.max(0,Date.now()/1000-ts); return s<90?`${s|0}s ago`:s<5400?`${(s/60)|0}m ago`:`${(s/3600)|0}h ago`; };
+
+async function refresh() {
+  try {
+    state = await api('/api/state');
+    clips = await api(tab==='history' ? '/api/clips' : '/api/clips?status=pending');
+    $('#pill-live').textContent = `${state.live.length} live`;
+    $('#pill-live').className = 'pill ' + (state.live.length ? 'on' : '');
+    const c = state.configured, missing = Object.keys(c).filter(k=>!c[k]);
+    $('#pill-cfg').textContent = missing.length ? `missing: ${missing.join(', ')}` : 'all connected';
+    $('#pill-cfg').className = 'pill ' + (missing.length ? 'off' : 'on');
+    const n = state.counts.pending||0, b = $('#b-review'); b.hidden = !n; b.textContent = n;
+  } catch (e) { $('#pill-cfg').textContent = 'offline: ' + e.message; $('#pill-cfg').className='pill off'; return; }
+  try { if (!editing) render(); } catch (e) { console.error(e); toast('Display error: ' + e.message); }
+}
+
+function render() {
+  const m = $('#main');
+  if (tab === 'review') m.innerHTML = reviewHTML();
+  else if (tab === 'live') m.innerHTML = liveHTML();
+  else if (tab === 'history') m.innerHTML = historyHTML();
+  else m.innerHTML = settingsHTML();
+  if (tab === 'review' && highlight) { const el = $('#clip-'+highlight); if (el) { el.classList.add('hl'); el.scrollIntoView?.({block:'center'}); highlight=null; } }
+}
+
+function reviewHTML() {
+  if (!clips.length) return `<div class="card mut">No clips waiting. When a tracked streamer goes live and something hype happens, it shows up here (and in Discord).</div>`;
+  const defaults = (state.settings.default_accounts||'').split(',').filter(Boolean);
+  const manual = isManual();
+  return clips.map(c => `
+    <div class="card clip" id="clip-${c.id}">
+      <div class="row"><b class="grow">${esc(c.handle)} <span class="mut">· ${esc(c.platform)}</span></b>
+        <span class="tag">${(c.end_s-c.start_s)|0}s</span><span class="tag">score ${c.score.toFixed(1)}</span></div>
+      <video controls playsinline preload="metadata" src="/api/clips/${c.id}/video" poster="/api/clips/${c.id}/thumb"></video>
+      <label>Caption</label><textarea id="cap-${c.id}" onfocus="editing=true" onblur="editing=false">${esc(c.caption)}</textarea>
+      ${manual ? '<div class="mut" style="margin-top:8px">Manual mode: Approve marks the clip, then download it and post it yourself.</div>' : `<label>Post to</label>
+      <div class="accts">${(accounts||[]).map(a=>`<label><input type="checkbox" class="acct-${c.id}" value="${esc(a.id)}"
+          ${(c.accounts? c.accounts.split(','): defaults).includes(a.id)?'checked':''}> ${esc(a.platform)} · ${esc(a.username)}</label>`).join('')
+          || `<span class="mut">No accounts loaded. Connect accounts in ${esc(posterLabel())} and set the API key.</span>`}</div>`}
+      ${c.post_error?`<div class="err">${esc(c.post_error)}</div>`:''}
+      <div class="row" style="margin-top:10px">
+        <button class="btn ok grow" onclick="approve(${c.id})">✅ ${manual ? 'Approve' : 'Approve &amp; post'}</button>
+        ${manual ? downloadBtn(c) : ''}
+        <button class="btn bad" onclick="reject(${c.id})">Reject</button></div>
+    </div>`).join('');
+}
+
+function liveHTML() {
+  const live = state.live.map(l => `
+    <div class="card"><div class="row"><span class="dot live"></span><b class="grow">${esc(l.handle)}
+      <span class="mut">· ${esc(l.platform)}</span></b><span class="tag">${l.viewers||0} viewers</span></div>
+      <div class="mut">${esc(l.title)}</div>
+      <div class="row mut" style="margin-top:6px"><span>${l.recording?'● recording':'○ not recording'}</span>
+        <span>chunks ${l.chunks}</span><span>clips ${l.clips}</span><span>${l.chat?'chat on':'chat off'}</span></div></div>`).join('');
+  const sts = state.streamers.map(s => `
+    <div class="card row"><span class="dot ${state.live.some(l=>l.handle===s.handle&&l.platform===s.platform)?'live':'idle'}"></span>
+      <div class="grow"><b>${esc(s.handle)}</b> <span class="mut">${esc(s.platform)}</span></div>
+      <button class="btn ghost" onclick="toggleStreamer(${s.id}, ${s.enabled?'false':'true'})">${s.enabled?'Pause':'Resume'}</button>
+      <button class="btn bad" onclick="delStreamer(${s.id})">✕</button></div>`).join('');
+  const errs = Object.entries(state.watcher.errors||{}).map(([k,v])=>`<div class="err">${esc(k)}: ${esc(v)}</div>`).join('');
+  return `<h2>Live now</h2>${live || '<div class="card mut">Nobody live right now.</div>'}
+    <h2>Tracked streamers</h2>${sts || '<div class="card mut">Add a streamer below.</div>'}
+    <div class="card"><div class="row"><select id="n-plat" style="width:110px" onfocus="editing=true" onblur="editing=false">
+      <option>twitch</option><option>kick</option><option>youtube</option></select>
+      <input id="n-handle" class="grow" placeholder="handle (YouTube: @handle or UC… id)" onfocus="editing=true" onblur="editing=false">
+      <button class="btn" onclick="addStreamer()">Add</button></div></div>
+    <div class="row"><button class="btn ghost" onclick="pollNow()">Check now</button>
+      <span class="mut">last check ${ago(state.watcher.last_poll)}</span></div>${errs}`;
+}
+
+function historyHTML() {
+  if (!clips.length) return `<div class="card mut">No clips yet.</div>`;
+  return clips.map(c => `<div class="card"><div class="row"><b class="grow">${esc(c.handle)}</b>
+      <span class="tag ${c.status}">${c.status}</span></div>
+      <div class="mut">#${c.id} · ${(c.end_s-c.start_s)|0}s · score ${c.score.toFixed(1)} · ${ago(c.created_at)}</div>
+      ${c.post_error?`<div class="err">${esc(c.post_error)}</div>`:''}
+      ${c.status==='failed'&&c.has_video?`<button class="btn" style="margin-top:8px" onclick="approve(${c.id})">Retry post</button>`:''}
+      ${c.has_video&&(c.status==='approved'||(isManual()&&c.status!=='rejected'))?`<div style="margin-top:8px">${downloadBtn(c)}</div>`:''}</div>`).join('');
+}
+
+const isManual = () => !!(state && state.poster && state.poster.manual);
+const posterLabel = () => (state && state.poster && state.poster.label) || 'your posting provider';
+const downloadBtn = c => `<a class="btn ghost" href="/api/clips/${c.id}/video?download=1" download>⬇ Download</a>`;
+
+const FIELDS = [
+  ['default_accounts','Default account ids for the posting provider (comma separated)','text'],
+  ['caption_template','Caption template ({streamer})','text'],
+  ['layout','Layout (blur or crop)','text'],
+  ['z_threshold','Hype threshold (lower = more clips)','number'],
+  ['pre_roll_s','Seconds kept before the moment','number'],
+  ['post_roll_s','Seconds kept after the peak','number'],
+  ['max_clip_s','Max clip length (s)','number'],
+  ['min_separation_s','Min gap between clips (s)','number'],
+  ['max_clips_per_hour','Max clips per hour','number'],
+  ['audio_weight','Audio weight','number'], ['chat_weight','Chat weight','number'],
+  ['poll_seconds','Live-check interval (s)','number'], ['chunk_seconds','Recording chunk length (s)','number'],
+  ['max_posts_per_day','Max posts per day','number'],
+];
+function settingsHTML() {
+  const s = state.settings, p = state.poster || {};
+  const pState = p.manual ? 'clips are approved here and downloaded, nothing is posted automatically'
+    : p.enabled ? 'API key set' : `API key missing (set ${esc(p.env_key)})`;
+  return `<div class="card"><div class="row"><b class="grow">Posting provider: ${esc(p.label || '?')}</b>
+      <span class="tag ${p.manual||p.enabled?'posted':'failed'}">${esc(p.provider || '')}</span></div>
+      <div class="mut">${pState}. Change it with POSTER_PROVIDER in .env (postforme, uploadpost, postproxy, none) and restart.</div></div>
+    <div class="card">${FIELDS.map(([k,l,t])=>`<label>${l}</label><input id="s-${k}" type="${t}" step="any" value="${esc(s[k])}"
+      onfocus="editing=true" onblur="editing=false">`).join('')}
+    <label class="row"><input type="checkbox" id="s-auto_approve" style="width:auto" ${s.auto_approve?'checked':''}> Auto-approve (post without review)</label>
+    <div class="row" style="margin-top:12px"><button class="btn grow" onclick="saveSettings()">Save</button>
+      <button class="btn ghost" onclick="testDiscord()">Test Discord</button></div></div>`;
+}
+
+async function approve(id) {
+  const caption = $('#cap-'+id)?.value;
+  const accts = [...document.querySelectorAll('.acct-'+id+':checked')].map(x=>x.value);
+  try { await api(`/api/clips/${id}/approve`, {method:'POST', body:{caption, accounts: accts.length?accts:null}});
+        toast(isManual() ? 'Approved. Download it from History' : 'Approved: posting…'); } catch(e) { toast(e.message); } refresh();
+}
+async function reject(id) { try { await api(`/api/clips/${id}/reject`, {method:'POST'}); } catch(e){ toast(e.message);} refresh(); }
+async function addStreamer() {
+  try { await api('/api/streamers', {method:'POST', body:{platform:$('#n-plat').value, handle:$('#n-handle').value}}); editing=false; toast('Added'); }
+  catch(e){ toast(e.message); } refresh();
+}
+async function toggleStreamer(id, en) { await api(`/api/streamers/${id}?enabled=${en}`, {method:'PATCH'}); refresh(); }
+async function delStreamer(id) { await api(`/api/streamers/${id}`, {method:'DELETE'}); refresh(); }
+async function pollNow() { toast('Checking…'); try { await api('/api/poll', {method:'POST'}); } catch(e){ toast(e.message);} refresh(); }
+async function saveSettings() {
+  const body = {}; FIELDS.forEach(([k])=>{ body[k] = $('#s-'+k).value; }); body.auto_approve = $('#s-auto_approve').checked;
+  try { await api('/api/settings', {method:'PUT', body}); toast('Saved'); editing=false; } catch(e){ toast(e.message); } refresh();
+}
+async function testDiscord() { try { const r = await api('/api/test/discord', {method:'POST'}); toast(r.ok?'Sent. Check Discord':'Discord not configured / rejected'); } catch(e){ toast(e.message);} }
+
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active')); b.classList.add('active');
+  tab = b.dataset.tab; editing=false; refresh();
+});
+function hashNav() { const m = location.hash.match(/^#clip-(\d+)/); if (m) { highlight = m[1]; tab='review'; } }
+hashNav(); window.onhashchange = () => { hashNav(); refresh(); };
+api('/api/accounts').then(a => { accounts = a; render(); }).catch(()=>{ accounts = []; });
+refresh(); setInterval(refresh, 5000);
+</script>
+</body>
+</html>
