@@ -40,10 +40,10 @@ class ChunkIndex:
 def probe_size(path: str, ffprobe: str = "ffprobe") -> tuple[int, int]:
     p = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
                         "-of", "csv=p=0:s=x", str(path)], capture_output=True, text=True)
-    try:
-        w, h = p.stdout.strip().split("x")
+    try:  # MPEG-TS chunks list the stream once per program, so only the first line counts
+        w, h = p.stdout.split()[0].strip().split("x")[:2]
         return int(w), int(h)
-    except ValueError:
+    except (ValueError, IndexError):
         return (0, 0)
 
 

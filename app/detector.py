@@ -17,7 +17,7 @@ class DetectorConfig:
     pre_roll_s: float = 40.0
     post_roll_s: float = 15.0
     max_clip_s: float = 90.0
-    min_clip_s: float = 20.0
+    min_clip_s: float = 61.0
     z_threshold: float = 3.0
     min_separation_s: float = 60.0
     max_clips_per_hour: int = 12
@@ -89,6 +89,11 @@ def _robust_z(series: np.ndarray, a: int, b: int, window: int, floor: float, blo
         scale = max(1.4826 * np.median(np.abs(base - med)), floor)
         z[k - a:e - a] = (series[k:e] - med) / scale
     return np.clip(z, -2.0, None)
+
+
+# A rendered clip can come out a fraction shorter than its window (chunk boundaries, frame rounding),
+# so windows are cut this much longer than min_clip_s to keep the file itself at or above the minimum.
+MIN_CLIP_MARGIN_S = 1.0
 
 
 class HypeDetector:
@@ -181,10 +186,13 @@ class HypeDetector:
             end = min(float(n), t + c.post_roll_s)
             if end - start > c.max_clip_s:
                 start = max(0.0, end - c.max_clip_s)
-            if end - start < c.min_clip_s:
-                end = min(float(n), start + c.min_clip_s)
-                if end - start < c.min_clip_s:
-                    start = max(0.0, end - c.min_clip_s)
+            # Minimum length wins over everything else. Add build-up before the moment first (keeps the
+            # ending tight); only if the stream has just started, run on past the peak instead.
+            need = c.min_clip_s + MIN_CLIP_MARGIN_S
+            if end - start < need:
+                start = max(0.0, end - need)
+                if end - start < need:
+                    end = min(float(n), start + need)
             out.append(Candidate(float(t), start, end, s, float(za[t - lo]), float(zc[t - lo])))
             self._emitted.append(float(t))
         return out

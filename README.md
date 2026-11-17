@@ -79,7 +79,8 @@ emotes/emoji/ALL CAPS. Each is converted to a robust z-score against the previou
 stream (median/MAD, so a quiet streamer's shout and a loud streamer's shout are both "big").
 `score = (w_audio·z_audio + w_chat·z_chat) / √(w_audio² + w_chat²)`. Local maxima above `z_threshold`
 (default 3.0), at least `min_separation_s` apart, become clips: `pre_roll_s` (40 s) before the onset of the
-rise to `post_roll_s` (15 s) after the peak, capped at `max_clip_s`. Chat is shifted back by `chat_delay_s`
+rise to `post_roll_s` (15 s) after the peak, capped at `max_clip_s`. Every clip is at least `min_clip_s`
+(61 s by default) long: shorter windows get extra build-up added before the moment. Chat is shifted back by `chat_delay_s`
 because chat reacts a few seconds late. Too many clips → raise `z_threshold`; missing moments → lower it.
 
 ## Tests (the pyramid)

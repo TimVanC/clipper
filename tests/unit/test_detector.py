@@ -119,3 +119,23 @@ def test_incremental_ingest_matches_single_shot(rng):
     got += [round(c.peak_s) for c in inc.pop_ready(final=True)]
     assert len(got) == len(expect) == 2
     assert all(abs(x - y) <= 3 for x, y in zip(sorted(got), sorted(expect)))
+
+
+def test_clips_are_never_shorter_than_the_minimum(rng):
+    d = HypeDetector(cfg())  # default min_clip_s = 61
+    d.ingest(audio_with_bursts(rng, 600, [(150, 158), (400, 404)]))
+    out = d.pop_ready(final=True)
+    assert len(out) == 2
+    for c in out:
+        assert c.end_s - c.start_s >= 62            # 61 s + the render safety margin
+        assert c.end_s == pytest.approx(c.peak_s + 15)  # extra length is build-up, the ending stays tight
+    # peak right after the stream started: no room before it, so the clip runs on past the peak instead
+    d = HypeDetector(cfg(warmup_s=10))
+    d.ingest(audio_with_bursts(rng, 120, [(20, 26)]))
+    c = d.pop_ready(final=True)[0]
+    assert c.start_s == 0 and c.end_s - c.start_s >= 62
+    # the minimum also wins over a smaller max_clip_s
+    d = HypeDetector(cfg(max_clip_s=30))
+    d.ingest(audio_with_bursts(rng, 300, [(150, 158)]))
+    c = d.pop_ready(final=True)[0]
+    assert c.end_s - c.start_s >= 62

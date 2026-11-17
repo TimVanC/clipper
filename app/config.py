@@ -103,7 +103,7 @@ class Settings:
     pre_roll_s: float = 40.0
     post_roll_s: float = 15.0
     max_clip_s: float = 90.0
-    min_clip_s: float = 20.0
+    min_clip_s: float = 61.0  # clips are never shorter than this
     z_threshold: float = 3.0
     min_separation_s: float = 60.0
     max_clips_per_hour: int = 12
