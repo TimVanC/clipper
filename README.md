@@ -46,6 +46,11 @@ Pick one with `POSTER_PROVIDER` in `.env` and restart:
 | `postproxy` | `POSTPROXY_API_KEY` | profile id, e.g. `prof_abc123` | one multipart post; provider defaults for TikTok privacy / YouTube title |
 | `none` | none | n/a | **free manual mode** |
 
+**Several providers at once**: `POSTER_PROVIDER=postproxy,uploadpost` (any mix except `none`). Each needs its
+key. Account ids are then prefixed with the provider, e.g. `postproxy/prof_abc123,uploadpost/main:youtube`, and
+one Approve sends the clip to each provider's accounts. If one provider fails and another succeeds, the clip is
+marked `posted` with the failure shown on it, so a retry can't double-post; repost the failed part by hand.
+
 **Manual mode (`none`)**: Approve only marks the clip `approved`; nothing is uploaded and no poster key or
 account is needed. The Review and History tabs show a **Download** button so you can post the file yourself.
 The daily post cap does not apply. `python -m app.doctor` checks only the selected provider.
@@ -81,7 +86,7 @@ because chat reacts a few seconds late. Too many clips → raise `z_threshold`; 
 
 ```bash
 pip install -r requirements-dev.txt
-make unit          # 44 tests, ~1 s: detection maths, parsers, state machines, API clients (mocked HTTP)
+make unit          # 50 tests, ~1 s: detection maths, parsers, state machines, API clients (mocked HTTP)
 make integration   # real ffmpeg / real streamlink over local HLS / real socket / real ASGI app
 make e2e           # synthetic stream → clip → Discord → approve → Post for Me, incl. chat timing
 ```

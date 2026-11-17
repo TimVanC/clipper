@@ -16,6 +16,18 @@ def _bool(v: Any) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
+def parse_poster_providers(value: str) -> list[str]:
+    """'postproxy, UploadPost' -> ['postproxy', 'uploadpost']; empty -> ['postforme']. Raises ValueError."""
+    names = list(dict.fromkeys(p.strip().lower() for p in str(value).split(",") if p.strip())) or ["postforme"]
+    bad = [n for n in names if n not in POSTER_PROVIDERS]
+    if bad:
+        raise ValueError(f"POSTER_PROVIDER must be one of {', '.join(POSTER_PROVIDERS)}, "
+                         f"or several separated by commas (got {value!r})")
+    if "none" in names and len(names) > 1:
+        raise ValueError("POSTER_PROVIDER=none (manual mode) cannot be combined with other providers")
+    return names
+
+
 def _read_dotenv(path: Path) -> dict[str, str]:
     """KEY=value lines from a .env file in the working directory (Docker passes them via env_file instead)."""
     out: dict[str, str] = {}
@@ -71,7 +83,8 @@ class Settings:
     discord_webhook_url: str = ""
     postforme_api_key: str = ""
     postforme_base_url: str = "https://api.postforme.dev/v1"
-    poster_provider: str = "postforme"  # postforme | uploadpost | postproxy | none (manual download)
+    # postforme | uploadpost | postproxy | none (manual download); several can be combined: "postproxy,uploadpost"
+    poster_provider: str = "postforme"
     uploadpost_api_key: str = ""
     uploadpost_base_url: str = "https://api.upload-post.com"
     postproxy_api_key: str = ""
@@ -108,9 +121,7 @@ class Settings:
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
         e = {**_read_dotenv(Path(".env")), **os.environ} if env is None else env  # real env vars win over .env
-        provider = e.get("POSTER_PROVIDER", "").strip().lower() or "postforme"
-        if provider not in POSTER_PROVIDERS:
-            raise ValueError(f"POSTER_PROVIDER must be one of {', '.join(POSTER_PROVIDERS)} (got {provider!r})")
+        provider = ",".join(parse_poster_providers(e.get("POSTER_PROVIDER", "")))
         s = cls(
             data_dir=Path(e.get("DATA_DIR", "./data")),
             twitch_client_id=e.get("TWITCH_CLIENT_ID", ""),
@@ -131,6 +142,7 @@ class Settings:
             gui_password=e.get("GUI_PASSWORD", ""),
             streamlink_cmd=e.get("STREAMLINK_CMD", "streamlink"),
             ffmpeg_cmd=e.get("FFMPEG_CMD", "ffmpeg"),
+            discord_max_upload_mb=float(e.get("DISCORD_MAX_UPLOAD_MB") or 8.0),
         )
         overrides = {k: e[k.upper()] for k in TUNABLES if k.upper() in e}
         s.update(overrides)
@@ -168,6 +180,9 @@ class Settings:
             setattr(self, k, val)
         return clean
 
+    def poster_names(self) -> list[str]:
+        return parse_poster_providers(self.poster_provider)
+
     def default_account_ids(self) -> list[str]:
         return [a.strip() for a in self.default_accounts.split(",") if a.strip()]
 
@@ -178,6 +193,7 @@ class Settings:
             "youtube": bool(self.youtube_api_key),
             "discord": bool(self.discord_webhook_url),
         }
-        if self.poster_provider != "none":  # manual mode needs no poster key
-            out[self.poster_provider] = bool(getattr(self, f"{self.poster_provider}_api_key", ""))
+        for name in self.poster_names():
+            if name != "none":  # manual mode needs no poster key
+                out[name] = bool(getattr(self, f"{name}_api_key", ""))
         return out

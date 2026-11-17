@@ -101,11 +101,24 @@ def make_thumb(video: str | Path, out_path: str | Path, ffmpeg: str = "ffmpeg", 
         raise RuntimeError(f"thumbnail failed: {p.stderr[-300:]}")
 
 
-def make_preview(video: str | Path, out_path: str | Path, ffmpeg: str = "ffmpeg") -> None:
-    """Small 360x640 copy (~6 MB for 90 s) so the Discord message can carry a playable preview."""
+def preview_params(duration_s: float, max_bytes: int) -> tuple[int, int]:
+    """(width, video bitrate) that makes the best-looking preview still fitting in max_bytes."""
+    audio, headroom = 64_000, 0.88  # container overhead + rate-control overshoot
+    total = max_bytes * 8 * headroom / max(duration_s, 1.0)
+    vbit = int(max(200_000, min(2_500_000, total - audio)))
+    width = 720 if vbit >= 800_000 else 540 if vbit >= 450_000 else 360
+    return width, vbit
+
+
+def make_preview(video: str | Path, out_path: str | Path, ffmpeg: str = "ffmpeg",
+                 max_bytes: int = 8 * 1024 * 1024) -> None:
+    """Smaller copy for the Discord message, sized to use the upload limit (the full clip is usually too big).
+    A 60 s clip gets about 720x1280 at 1 Mbit/s under the 8 MB default; longer clips step down."""
+    width, vbit = preview_params(probe_duration(video) or 90.0, max_bytes)
     p = subprocess.run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(video),
-                        "-vf", "scale=360:-2", "-c:v", "libx264", "-preset", "veryfast", "-crf", "32",
-                        "-maxrate", "550k", "-bufsize", "1100k", "-c:a", "aac", "-b:a", "48k", "-ac", "1",
+                        "-vf", f"scale={width}:-2", "-c:v", "libx264", "-preset", "fast",
+                        "-b:v", str(vbit), "-maxrate", str(vbit), "-bufsize", str(vbit * 2),
+                        "-c:a", "aac", "-b:a", "64k", "-ac", "2",
                         "-movflags", "+faststart", str(out_path)], capture_output=True, text=True)
     if p.returncode != 0 or not Path(out_path).exists():
         raise RuntimeError(f"preview failed: {p.stderr[-300:]}")

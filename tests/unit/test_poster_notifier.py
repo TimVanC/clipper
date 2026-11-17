@@ -82,3 +82,27 @@ async def test_discord_failure_does_not_raise():
     respx.post("https://discord.test/hook").respond(500)
     async with httpx.AsyncClient() as http:
         assert await DiscordNotifier("https://discord.test/hook", http).test() is False
+
+
+@respx.mock
+async def test_discord_clip_message_is_resent_without_file_if_upload_is_refused(tmp_path):
+    hook = respx.post("https://discord.test/hook").mock(side_effect=[httpx.Response(413), httpx.Response(204)])
+    small = tmp_path / "s.mp4"
+    small.write_bytes(b"a" * 1000)
+    clip = {"id": 7, "handle": "speed", "start_s": 0, "end_s": 60, "score": 5.5, "audio_z": 6.0, "chat_z": 2.0,
+            "path": str(small)}
+    async with httpx.AsyncClient() as http:
+        assert await DiscordNotifier("https://discord.test/hook", http, "https://clip.app").notify_clip(clip)
+    assert hook.call_count == 2
+    assert hook.calls[1].request.headers["content-type"].startswith("application/json")
+
+
+def test_preview_is_sized_to_the_upload_limit():
+    from app.clipper import preview_params
+    mb = 1024 * 1024
+    w, v = preview_params(58, 8 * mb)
+    assert w == 720 and 900_000 < v < 1_100_000
+    assert (v + 64_000) * 58 / 8 < 8 * mb          # fits with headroom
+    assert preview_params(90, 8 * mb)[0] == 540     # longer clip steps down
+    assert preview_params(180, 8 * mb)[0] == 360
+    assert preview_params(60, 50 * mb) == (720, 2_500_000)  # capped

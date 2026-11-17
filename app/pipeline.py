@@ -145,7 +145,7 @@ class SessionWorker:
             clip = pl.db.get_clip(clip_id)
             preview: Path | None = pl.clips_dir / f"{clip_id}_preview.mp4"
             try:
-                await asyncio.to_thread(make_preview, out, preview, pl.s.ffmpeg_cmd)
+                await asyncio.to_thread(make_preview, out, preview, pl.s.ffmpeg_cmd, pl.notifier.max_upload_bytes)
             except Exception:
                 log.warning("preview failed for clip %s", clip_id)
                 preview = None
@@ -274,8 +274,13 @@ class Pipeline:
         try:
             res = await self.poster.publish(Path(clip["path"]), clip["caption"], clip["accounts"].split(","),
                                             external_id=f"clip-{clip_id}")
-            self.db.update_clip(clip_id, status="posted", post_id=res["post_id"], posted_at=time.time())
-            await self.notifier.notify_posted(clip, True, f"-> {len(clip['accounts'].split(','))} account(s)")
+            partial = res.get("partial_error", "")  # combined providers: some posted, some failed
+            self.db.update_clip(clip_id, status="posted", post_id=res["post_id"], posted_at=time.time(),
+                                post_error=partial[:300])
+            if partial:
+                await self.notifier.notify_posted(clip, False, f"partly posted: {partial}"[:300])
+            else:
+                await self.notifier.notify_posted(clip, True, f"-> {len(clip['accounts'].split(','))} account(s)")
         except Exception as e:
             log.exception("posting clip %s failed", clip_id)
             self.db.update_clip(clip_id, status="failed", post_error=str(e)[:300])

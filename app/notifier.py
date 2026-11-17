@@ -56,7 +56,9 @@ class DiscordNotifier:
         full = Path(clip["path"]) if clip.get("path") else None
         attach = next((p for p in (full, preview)  # full clip if it fits, otherwise the small preview
                        if p and p.exists() and p.stat().st_size <= self.max_upload_bytes), None)
-        return await self._send(payload, attach)
+        if attach and await self._send(payload, attach):
+            return True
+        return await self._send(payload)  # no attachment, or Discord refused it: still send the link
 
     async def notify_posted(self, clip: dict, ok: bool, detail: str = "") -> bool:
         icon = "✅ Posted" if ok else "❌ Post failed"

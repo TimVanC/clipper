@@ -5,6 +5,7 @@ import httpx
 
 from .base import Poster, PosterError
 from .manual import ManualPoster
+from .multi import MultiPoster
 from .postforme import PostForMe, PostForMeError
 from .postproxy import Postproxy, PostproxyError
 from .uploadpost import UploadPost, UploadPostError
@@ -12,15 +13,15 @@ from .uploadpost import UploadPost, UploadPostError
 PROVIDERS: dict[str, type[Poster]] = {
     "postforme": PostForMe, "uploadpost": UploadPost, "postproxy": Postproxy, "none": ManualPoster}
 
-__all__ = ["Poster", "PosterError", "ManualPoster", "PostForMe", "PostForMeError", "Postproxy", "PostproxyError",
+__all__ = ["Poster", "PosterError", "ManualPoster", "MultiPoster", "PostForMe", "PostForMeError", "Postproxy", "PostproxyError",
            "UploadPost", "UploadPostError", "PROVIDERS", "make_poster"]
 
 
 def make_poster(settings, http: httpx.AsyncClient) -> Poster:
-    """Build the poster selected by settings.poster_provider."""
-    name = settings.poster_provider
-    if name not in PROVIDERS:
-        raise ValueError(f"POSTER_PROVIDER must be one of {', '.join(PROVIDERS)} (got {name!r})")
-    if name == "none":
+    """Build the poster selected by settings.poster_provider (several names = one MultiPoster)."""
+    names = settings.poster_names()  # validates
+    if names == ["none"]:
         return ManualPoster()
-    return PROVIDERS[name](getattr(settings, f"{name}_api_key"), http, getattr(settings, f"{name}_base_url"))
+    posters = [PROVIDERS[n](getattr(settings, f"{n}_api_key"), http, getattr(settings, f"{n}_base_url"))
+               for n in names]
+    return posters[0] if len(posters) == 1 else MultiPoster(posters)

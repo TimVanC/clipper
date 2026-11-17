@@ -58,19 +58,22 @@ async def run(s: Settings) -> int:
             report("Discord webhook", ok, "test message sent" if ok else "webhook rejected the message")
         else:
             report("Discord webhook", None, "DISCORD_WEBHOOK_URL not set")
-        poster = make_poster(s, http)  # only the provider chosen by POSTER_PROVIDER is checked
-        name = f"Poster: {poster.label}"
-        if poster.manual:
-            report(name, None, "POSTER_PROVIDER=none: nothing to check, clips are downloaded from the GUI")
-        elif not poster.enabled:
-            report(name, None, f"{poster.env_key} not set")
-        else:
-            try:
-                accts = await poster.list_accounts()
-                report(name, True, f"{len(accts)} connected account(s): "
-                       + ", ".join(f"{a['platform']}:{a['username']}({a['id']})" for a in accts))
-            except Exception as e:
-                report(name, False, str(e)[:200])
+        top = make_poster(s, http)  # only the provider(s) chosen by POSTER_PROVIDER are checked
+        subs = getattr(top, "posters", None)
+        for poster in subs or [top]:
+            name = f"Poster: {poster.label}"
+            prefix = f"{poster.name}/" if subs else ""  # combined mode: account ids carry the provider name
+            if poster.manual:
+                report(name, None, "POSTER_PROVIDER=none: nothing to check, clips are downloaded from the GUI")
+            elif not poster.enabled:
+                report(name, False if subs else None, f"{poster.env_key} not set")
+            else:
+                try:
+                    accts = await poster.list_accounts()
+                    report(name, True, f"{len(accts)} connected account(s): "
+                           + ", ".join(f"{a['platform']}:{a['username']}({prefix}{a['id']})" for a in accts))
+                except Exception as e:
+                    report(name, False, str(e)[:200])
     return 1 if failures else 0
 
 

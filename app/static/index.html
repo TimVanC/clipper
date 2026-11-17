@@ -179,7 +179,7 @@ function settingsHTML() {
     : p.enabled ? 'API key set' : `API key missing (set ${esc(p.env_key)})`;
   return `<div class="card"><div class="row"><b class="grow">Posting provider: ${esc(p.label || '?')}</b>
       <span class="tag ${p.manual||p.enabled?'posted':'failed'}">${esc(p.provider || '')}</span></div>
-      <div class="mut">${pState}. Change it with POSTER_PROVIDER in .env (postforme, uploadpost, postproxy, none) and restart.</div></div>
+      <div class="mut">${pState}. Change it with POSTER_PROVIDER in .env (postforme, uploadpost, postproxy, none, or several separated by commas) and restart.</div></div>
     <div class="card">${FIELDS.map(([k,l,t])=>`<label>${l}</label><input id="s-${k}" type="${t}" step="any" value="${esc(s[k])}"
       onfocus="editing=true" onblur="editing=false">`).join('')}
     <label class="row"><input type="checkbox" id="s-auto_approve" style="width:auto" ${s.auto_approve?'checked':''}> Auto-approve (post without review)</label>
