@@ -16,6 +16,23 @@ def _bool(v: Any) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _read_dotenv(path: Path) -> dict[str, str]:
+    """KEY=value lines from a .env file in the working directory (Docker passes them via env_file instead)."""
+    out: dict[str, str] = {}
+    if not path.is_file():
+        return out
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        out[k.strip()] = v
+    return out
+
+
 # name -> (type, min, max) for GUI-editable tunables
 TUNABLES: dict[str, tuple[type, float | None, float | None]] = {
     "poll_seconds": (int, 10, 3600),
@@ -90,7 +107,7 @@ class Settings:
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
-        e = os.environ if env is None else env
+        e = {**_read_dotenv(Path(".env")), **os.environ} if env is None else env  # real env vars win over .env
         provider = e.get("POSTER_PROVIDER", "").strip().lower() or "postforme"
         if provider not in POSTER_PROVIDERS:
             raise ValueError(f"POSTER_PROVIDER must be one of {', '.join(POSTER_PROVIDERS)} (got {provider!r})")
