@@ -12,14 +12,15 @@ from typing import Callable
 from .captions import build_caption
 from .chat import ChatLog, TwitchChatListener
 from .clipper import ChunkIndex, make_preview, make_thumb, render_clip
-from .config import Settings
+from .config import Settings, parse_categories, split_list
+from .facecam import choose_layout
 from .db import Database
 from .detector import DetectorConfig, HypeDetector, audio_db_per_second, decode_audio, SR
 from .notifier import DiscordNotifier
 from .platforms.base import LiveInfo, PlatformClient
 from .posters import Poster
 from .recorder import Recorder, streamlink_source
-from .watcher import Watcher
+from .watcher import CategoryWatch, Watcher
 
 log = logging.getLogger("clipper.pipeline")
 
@@ -128,15 +129,17 @@ class SessionWorker:
                                      cand.end_s, cand.peak_s, cand.score, cand.audio_z, cand.chat_z)
             out = pl.clips_dir / f"{clip_id}.mp4"
             thumb = pl.clips_dir / f"{clip_id}.jpg"
+            # the watcher holds the newest title/category: the stream may have switched games since it started
+            now = pl.watcher.live.get((self.info.platform, self.info.handle.lower()), self.info)
             try:
                 pieces = self.index.pieces(cand.start_s, cand.end_s)
-                await asyncio.to_thread(render_clip, pieces, out, pl.s.layout, pl.s.ffmpeg_cmd)
+                layout, split = await asyncio.to_thread(choose_layout, pieces, pl.s.layout, now.game,
+                                                        self.info.handle, pl.s.facecam_boxes, pl.s.ffmpeg_cmd)
+                await asyncio.to_thread(render_clip, pieces, out, layout, pl.s.ffmpeg_cmd, split)
                 try:
                     await asyncio.to_thread(make_thumb, out, thumb, pl.s.ffmpeg_cmd, min(3.0, (cand.end_s - cand.start_s) / 2))
                 except Exception:
                     thumb = Path("")
-                # the watcher holds the newest title/category: the stream may have switched games since it started
-                now = pl.watcher.live.get((self.info.platform, self.info.handle.lower()), self.info)
                 caption = build_caption(pl.s.caption_template, handle=self.info.handle, platform=self.info.platform,
                                         name=now.name or self.info.name, title=now.title, game=now.game,
                                         seed=clip_id, hooks=pl.s.caption_hooks, extra_tags=pl.s.hashtags,
@@ -183,7 +186,15 @@ class Pipeline:
         self.watcher = Watcher(
             clients,
             lambda: [(r["platform"], r["handle"]) for r in db.list_streamers(enabled_only=True)],
-            self.on_live, self.on_offline, grace_polls=lambda: self.s.offline_grace_polls)
+            self.on_live, self.on_offline, grace_polls=lambda: self.s.offline_grace_polls,
+            category_watch=self.category_watch)
+
+    def category_watch(self) -> CategoryWatch | None:
+        cats = parse_categories(self.s.watch_categories)
+        if not cats or self.s.category_streams <= 0:
+            return None
+        return CategoryWatch(cats, self.s.category_streams, self.s.category_min_viewers,
+                             split_list(self.s.category_languages), set(split_list(self.s.category_exclude)))
 
     # ---- lifecycle -------------------------------------------------
     def load_overrides(self) -> None:
@@ -311,7 +322,8 @@ class Pipeline:
             live.append({"platform": plat, "handle": handle, "title": info.title, "viewers": info.viewers,
                          "url": info.url, "recording": bool(w and w.recorder and not w.recorder.finished),
                          "chunks": w.processed if w else 0, "clips": w.clips if w else 0,
-                         "chat": bool(w and w.chat and getattr(w.chat, "connected", False))})
+                         "chat": bool(w and w.chat and getattr(w.chat, "connected", False)),
+                         "game": info.game, "auto": self.watcher.auto.get((plat, handle), "")})
         return {"live": live, "streamers": self.db.list_streamers(), "counts": self.db.counts(),
                 "configured": self.s.configured(), "poster": self.poster.info(), "watcher": {"last_poll": self.watcher.last_poll,
                                                                "errors": self.watcher.last_error}}

@@ -107,6 +107,14 @@ async def test_render_clip_across_chunk_boundaries(synthetic_mp4, tmp_path, layo
     assert thumb.stat().st_size > 500
 
 
+def test_render_split_layout(synthetic_mp4, tmp_path):
+    out = tmp_path / "split.mp4"
+    render_clip([(str(synthetic_mp4), 10, 8)], out, "split", split=((0.0, 0.1, 0.3, 0.3), (0.3, 0.0, 0.53, 1.0)))
+    v = probe_video(out)
+    assert (v["width"], v["height"]) == (1080, 1920)
+    assert probe_duration(out) == pytest.approx(8, abs=0.8)
+
+
 def test_render_clip_rejects_empty_and_reports_ffmpeg_errors(tmp_path):
     with pytest.raises(ValueError):
         render_clip([], tmp_path / "x.mp4")

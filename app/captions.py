@@ -46,6 +46,20 @@ YOUTUBE_TITLE_MAX = 100
 HASHTAG = re.compile(r"(?<!\w)#(?=\w*[^\W\d_])(\w+)")  # '#word', but not '#1'
 
 
+def clean_category(name: str) -> str:
+    """'Grand Theft Auto VI (GTA)' (Kick) -> 'Grand Theft Auto VI' (Twitch's name for the same game)."""
+    return re.sub(r"\s*\([^)]*\)\s*$", "", (name or "").strip())
+
+
+def same_category(a: str, b: str) -> bool:
+    return clean_category(a).lower() == clean_category(b).lower() != ""
+
+
+def is_game(category: str) -> bool:
+    """True for a real game category, False for Just Chatting, IRL, music... and unknown ('')."""
+    return clean_category(category).lower() not in NOT_A_GAME
+
+
 def tag(text: str) -> str:
     """'Just Chatting' -> 'justchatting', 'caseoh_' -> 'caseoh' (hashtags break on anything but letters/digits)."""
     return re.sub(r"[\W_]+", "", str(text).lower())
@@ -58,7 +72,7 @@ def display_name(handle: str, name: str = "") -> str:
 
 
 def game_tag(game: str) -> str:
-    g = (game or "").strip().lower()
+    g = clean_category(game).lower()
     return GAME_TAGS[g] if g in GAME_TAGS else tag(g)
 
 
@@ -83,7 +97,7 @@ def _hooks(custom: str, game: str) -> list[str]:
     own = [h.strip() for h in (custom or "").replace("\\n", "\n").splitlines() if h.strip()]
     if own:
         return own
-    return DEFAULT_HOOKS + (GAME_HOOKS if (game or "").strip().lower() not in NOT_A_GAME else [])
+    return DEFAULT_HOOKS + (GAME_HOOKS if is_game(game) else [])
 
 
 def validate(template: str, hooks: str = "") -> None:
@@ -104,7 +118,7 @@ def build_caption(template: str = DEFAULT_TEMPLATE, *, handle: str, platform: st
                   max_tags: int = 5) -> str:
     """seed (the clip id) rotates through the hooks so consecutive clips don't read the same."""
     who = display_name(handle, name)
-    base = {"streamer": handle, "name": who, "game": (game or "").strip(), "title": (title or "").strip(),
+    base = {"streamer": handle, "name": who, "game": clean_category(game), "title": (title or "").strip(),
             "platform": platform}
     pool = _hooks(hooks, game)
     try:

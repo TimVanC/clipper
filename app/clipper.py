@@ -47,9 +47,21 @@ def probe_size(path: str, ffprobe: str = "ffprobe") -> tuple[int, int]:
         return (0, 0)
 
 
-def build_filtergraph(n_pieces: int, layout: str, norm: tuple[int, int] | None = None) -> str:
+Box = tuple[float, float, float, float]  # x, y, w, h as fractions of the frame
+
+
+def _crop_to(box: Box, w: int, h: int) -> str:
+    """Crop a box given as fractions of the frame, then fill a w x h panel."""
+    x, y, bw, bh = box
+    return (f"crop=w=trunc(iw*{bw:.5f}/2)*2:h=trunc(ih*{bh:.5f}/2)*2:x=trunc(iw*{x:.5f}):y=trunc(ih*{y:.5f}),"
+            f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1")
+
+
+def build_filtergraph(n_pieces: int, layout: str, norm: tuple[int, int] | None = None,
+                      split: tuple[Box, Box] | None = None) -> str:
     """norm=None: all pieces already share a size (the normal case, no re-scaling needed).
-    norm=(w, h): letterbox every piece to that size first (stream changed resolution mid-way)."""
+    norm=(w, h): letterbox every piece to that size first (stream changed resolution mid-way).
+    split=(cam box, game box): layout 'split', cam on top (1080x768) and game below (1080x1152)."""
     parts = []
     for i in range(n_pieces):
         if norm:
@@ -61,7 +73,11 @@ def build_filtergraph(n_pieces: int, layout: str, norm: tuple[int, int] | None =
         parts.append(v + f";[{i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a{i}]")
     joined = "".join(f"[v{i}][a{i}]" for i in range(n_pieces))
     parts.append(f"{joined}concat=n={n_pieces}:v=1:a=1[cv][aout]")
-    if layout == "crop":
+    if layout == "split" and split:
+        cam, game = split
+        parts.append(f"[cv]split=2[cam][game];[cam]{_crop_to(cam, 1080, 768)}[top];"
+                     f"[game]{_crop_to(game, 1080, 1152)}[bot];[top][bot]vstack=inputs=2,format=yuv420p[vout]")
+    elif layout == "crop":
         parts.append("[cv]scale=-2:1920,crop=1080:1920,format=yuv420p[vout]")
     else:  # blur: sharp 16:9 stream centred over a blurred, zoomed copy (the standard clip look)
         parts.append(
@@ -75,7 +91,9 @@ def build_filtergraph(n_pieces: int, layout: str, norm: tuple[int, int] | None =
     return ";".join(parts)
 
 
-def render_clip(pieces: list[Piece], out_path: str | Path, layout: str = "blur", ffmpeg: str = "ffmpeg") -> None:
+def render_clip(pieces: list[Piece], out_path: str | Path, layout: str = "blur", ffmpeg: str = "ffmpeg",
+                split: tuple[Box, Box] | None = None) -> None:
+    """layout: blur | crop | split (needs split=(cam box, game box), see app/facecam.py; without it: blur)."""
     if not pieces:
         raise ValueError("no media pieces for this window")
     out_path = Path(out_path)
@@ -85,7 +103,7 @@ def render_clip(pieces: list[Piece], out_path: str | Path, layout: str = "blur",
     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
     for path, ss, dur in pieces:
         cmd += ["-ss", f"{ss:.3f}", "-t", f"{dur:.3f}", "-i", path]
-    cmd += ["-filter_complex", build_filtergraph(len(pieces), layout, norm),
+    cmd += ["-filter_complex", build_filtergraph(len(pieces), layout, norm, split),
             "-map", "[vout]", "-map", "[aout]",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-r", "30",
             "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(out_path)]

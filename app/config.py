@@ -8,7 +8,8 @@ from typing import Any
 
 from . import captions
 
-LAYOUTS = ("blur", "crop")
+LAYOUTS = ("auto", "split", "blur", "crop")
+CATEGORY_PLATFORMS = ("twitch", "kick")
 POSTER_PROVIDERS = ("postforme", "uploadpost", "postproxy", "none")
 
 
@@ -28,6 +29,28 @@ def parse_poster_providers(value: str) -> list[str]:
     if "none" in names and len(names) > 1:
         raise ValueError("POSTER_PROVIDER=none (manual mode) cannot be combined with other providers")
     return names
+
+
+def parse_categories(value: str) -> list[tuple[str | None, str]]:
+    """'Grand Theft Auto VI, kick:Fortnite' -> [(None, 'Grand Theft Auto VI'), ('kick', 'Fortnite')].
+    A prefix is only a platform when it is one ('Call of Duty: Warzone' stays a name)."""
+    out: list[tuple[str | None, str]] = []
+    for part in str(value).replace("\n", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        plat, sep, name = part.partition(":")
+        if sep and plat.strip().lower() in CATEGORY_PLATFORMS:
+            if not name.strip():
+                raise ValueError(f"watch_categories: no category name after {plat.strip()}:")
+            out.append((plat.strip().lower(), name.strip()))
+        else:
+            out.append((None, part))
+    return out
+
+
+def split_list(value: str) -> list[str]:
+    return [p.strip().lstrip("@").lower() for p in str(value).replace("\n", ",").split(",") if p.strip()]
 
 
 def _read_dotenv(path: Path) -> dict[str, str]:
@@ -65,6 +88,12 @@ TUNABLES: dict[str, tuple[type, float | None, float | None]] = {
     "chat_delay_s": (float, 0, 60),
     "max_posts_per_day": (int, 1, 500),
     "layout": (str, None, None),
+    "facecam_boxes": (str, None, None),
+    "watch_categories": (str, None, None),
+    "category_streams": (int, 0, 10),
+    "category_min_viewers": (int, 0, 10_000_000),
+    "category_languages": (str, None, None),
+    "category_exclude": (str, None, None),
     "auto_approve": (bool, None, None),
     "delete_raw": (bool, None, None),
     "default_accounts": (str, None, None),
@@ -117,7 +146,16 @@ class Settings:
     chat_weight: float = 1.5
     chat_delay_s: float = 8.0
     max_posts_per_day: int = 20
-    layout: str = "blur"
+    # auto: facecam on top + game below while a game is played and a cam is found, blur otherwise
+    layout: str = "auto"
+    facecam_boxes: str = ""         # "handle=x,y,w,h; ..." pins a streamer's cam (fractions of the frame)
+    # record the biggest streams in these categories, whoever streams them: "Grand Theft Auto VI",
+    # or per platform: "twitch:Grand Theft Auto VI, kick:Grand Theft Auto VI"
+    watch_categories: str = ""
+    category_streams: int = 3       # recorded at once from categories, all platforms together
+    category_min_viewers: int = 1000
+    category_languages: str = "en"  # comma separated; empty = any language
+    category_exclude: str = ""      # handles never to pick from a category
     auto_approve: bool = False
     delete_raw: bool = True
     default_accounts: str = ""
@@ -178,7 +216,12 @@ class Settings:
                 if hi is not None and val > hi:
                     raise ValueError(f"{k}: must be <= {hi}")
             if k == "layout" and val not in LAYOUTS:
-                raise ValueError(f"layout must be one of {LAYOUTS}")
+                raise ValueError(f"layout must be one of {', '.join(LAYOUTS)}")
+            if k == "facecam_boxes":
+                from .facecam import parse_boxes
+                parse_boxes(val)
+            if k == "watch_categories":
+                parse_categories(val)
             if k == "caption_template":
                 captions.validate(val.replace("\\n", "\n"))
             if k == "caption_hooks":

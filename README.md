@@ -10,7 +10,7 @@ with 40 s of build-up, pings you on Discord, and posts to your socials when you 
                                                        │
         audio loudness  +  Twitch chat rate/emotes ──▶ HypeDetector (robust z-scores, peak picking)
                                                        │  window = onset - 40 s … peak + 15 s
-                                          ffmpeg render 1080x1920 (blurred-background layout)
+                                          ffmpeg render 1080x1920 (facecam-over-game split, or blurred background)
                                                        │
                           Discord "clip ready" + preview ─▶ GUI review page ─▶ [Approve]
                                                        │
@@ -55,6 +55,34 @@ marked `posted` with the failure shown on it, so a retry can't double-post; repo
 account is needed. The Review and History tabs show a **Download** button so you can post the file yourself.
 The daily post cap does not apply. `python -m app.doctor` checks only the selected provider.
 Account ids are provider-specific, so update *Default accounts* when you switch.
+
+## Auto-watching a category (e.g. GTA VI)
+
+Besides the streamers you add by hand, the app can record **the biggest streams in a category, whoever is
+streaming it**. In *Settings → Auto-watch categories* put `Grand Theft Auto VI` (both Twitch and Kick), or
+`twitch:…` / `kick:…` for one site, several separated by commas.
+
+- Every poll it asks Twitch (Helix `streams?game_id=`) and Kick (`/public/v1/livestreams?category_id=&sort=viewer_count`,
+  falling back to v2) for the live streams in that category, most viewers first.
+- It records up to *Category streams recorded at once* (default 3, both sites together) that have at least
+  *min viewers* (default 1000) and speak one of *languages* (default `en`). Streamers you added by hand don't use a slot.
+- A picked stream keeps its slot until it ends or switches to another game; dropping a few places in the
+  ranking does not stop it. Then the next biggest stream takes the slot. *never pick these handles* skips some.
+- The Live tab marks these streams `auto · <category>`. Kick's `Grand Theft Auto VI (GTA)` matches `Grand Theft Auto VI`.
+
+Each auto stream is a full recording (2-4 GB/hour of disk while live, plus CPU for analysis and rendering).
+
+## Layout: facecam on top, game below
+
+With *Layout* `auto` (the default), a clip from a game category gets the split layout: the streamer's facecam
+in the top 40 %, the game in the bottom 60 %. Just Chatting, IRL and unknown categories keep the blurred layout.
+
+`app/facecam.py` samples 10 frames of the clip and runs OpenCV's YuNet face detector (model in `app/models/`).
+A face counts as the facecam only if it is found in the same place in most frames, keeps moving (a poster or a
+logo doesn't), and sits in a box with at least two straight edges, which the crop then snaps to. Anything
+else falls back to the blurred layout, so a green-screen streamer with no cam box gets blur. For a streamer it
+gets wrong, *Settings → Pin a facecam* takes `handle=x,y,w,h` (fractions of the frame, e.g. `caseoh_=0,0.12,0.21,0.27`).
+Layout `split` forces the split whatever the category; `blur` and `crop` are the old fixed layouts.
 
 ## Captions and hashtags
 

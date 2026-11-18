@@ -125,8 +125,9 @@ function reviewHTML() {
 function liveHTML() {
   const live = state.live.map(l => `
     <div class="card"><div class="row"><span class="dot live"></span><b class="grow">${esc(l.handle)}
-      <span class="mut">· ${esc(l.platform)}</span></b><span class="tag">${l.viewers||0} viewers</span></div>
-      <div class="mut">${esc(l.title)}</div>
+      <span class="mut">· ${esc(l.platform)}</span></b>${l.auto?`<span class="tag approved">auto · ${esc(l.auto)}</span>`:''}
+      <span class="tag">${l.viewers||0} viewers</span></div>
+      <div class="mut">${esc(l.game||'')}${l.game?' · ':''}${esc(l.title)}</div>
       <div class="row mut" style="margin-top:6px"><span>${l.recording?'● recording':'○ not recording'}</span>
         <span>chunks ${l.chunks}</span><span>clips ${l.clips}</span><span>${l.chat?'chat on':'chat off'}</span></div></div>`).join('');
   const sts = state.streamers.map(s => `
@@ -135,7 +136,12 @@ function liveHTML() {
       <button class="btn ghost" onclick="toggleStreamer(${s.id}, ${s.enabled?'false':'true'})">${s.enabled?'Pause':'Resume'}</button>
       <button class="btn bad" onclick="delStreamer(${s.id})">✕</button></div>`).join('');
   const errs = Object.entries(state.watcher.errors||{}).map(([k,v])=>`<div class="err">${esc(k)}: ${esc(v)}</div>`).join('');
-  return `<h2>Live now</h2>${live || '<div class="card mut">Nobody live right now.</div>'}
+  const st = state.settings, cats = (st.watch_categories||'').trim();
+  const auto = cats && st.category_streams > 0
+    ? `<div class="card mut">Auto-watching the top ${st.category_streams} stream(s) in <b>${esc(cats)}</b>
+        (${st.category_min_viewers}+ viewers${st.category_languages?', '+esc(st.category_languages):''}). Change it in Settings.</div>`
+    : `<div class="card mut">Category auto-watch is off. Set it in Settings, e.g. Grand Theft Auto VI.</div>`;
+  return `<h2>Live now</h2>${auto}${live || '<div class="card mut">Nobody live right now.</div>'}
     <h2>Tracked streamers</h2>${sts || '<div class="card mut">Add a streamer below.</div>'}
     <div class="card"><div class="row"><select id="n-plat" style="width:110px" onfocus="editing=true" onblur="editing=false">
       <option>twitch</option><option>kick</option><option>youtube</option></select>
@@ -165,7 +171,13 @@ const FIELDS = [
   ['caption_hooks','Opening lines, one per line, rotated per clip ({name}, {game}). Empty = built-in set','area'],
   ['hashtags','Extra hashtags, after the streamer / game / platform tags','text'],
   ['max_hashtags','Max hashtags (the network tag #fyp / #shorts is added on top)','number'],
-  ['layout','Layout (blur or crop)','text'],
+  ['watch_categories','Auto-watch categories: biggest streams in these, whoever streams them (e.g. Grand Theft Auto VI; kick:… or twitch:… for one site)','text'],
+  ['category_streams','Category streams recorded at once (0 = off)','number'],
+  ['category_min_viewers','Category: min viewers','number'],
+  ['category_languages','Category: languages (comma separated, empty = any)','text'],
+  ['category_exclude','Category: never pick these handles','text'],
+  ['layout','Layout: auto (facecam on top for games, else blur), split, blur or crop','text'],
+  ['facecam_boxes','Pin a facecam: handle=x,y,w,h as fractions of the frame (only when auto gets it wrong)','text'],
   ['z_threshold','Hype threshold (lower = more clips)','number'],
   ['pre_roll_s','Seconds kept before the moment','number'],
   ['post_roll_s','Seconds kept after the peak','number'],
