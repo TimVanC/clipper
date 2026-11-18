@@ -12,6 +12,8 @@ class LiveInfo:
     stream_id: str = ""
     url: str = ""
     viewers: int = 0
+    game: str = ""  # current category, used for captions
+    name: str = ""  # display name, e.g. "CaseOh_" for the handle "caseoh_"
 
 
 class PlatformClient(Protocol):

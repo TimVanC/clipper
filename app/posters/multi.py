@@ -65,6 +65,8 @@ class MultiPoster(Poster):
                 res = await p.publish(path, caption, accts, external_id)
                 raw[name] = res
                 ids.append(f"{name}:{res.get('post_id', '')}")
+                if res.get("partial_error"):
+                    errors.append(f"{p.label}: {res['partial_error']}")
             except Exception as e:
                 log.warning("%s publish failed: %s", p.label, e)
                 errors.append(f"{p.label}: {e}")

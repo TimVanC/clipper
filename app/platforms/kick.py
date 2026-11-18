@@ -51,5 +51,6 @@ class KickClient:
                 if slug and st.get("is_live"):
                     out[slug] = LiveInfo("kick", slug, ch.get("stream_title", "") or "",
                                          str(st.get("start_time", "")), f"https://kick.com/{slug}",
-                                         int(st.get("viewer_count", 0) or 0))
+                                         int(st.get("viewer_count", 0) or 0),
+                                         str((ch.get("category") or {}).get("name", "") or ""))
         return out

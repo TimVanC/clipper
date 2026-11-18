@@ -56,6 +56,23 @@ account is needed. The Review and History tabs show a **Download** button so you
 The daily post cap does not apply. `python -m app.doctor` checks only the selected provider.
 Account ids are provider-specific, so update *Default accounts* when you switch.
 
+## Captions and hashtags
+
+Each clip gets a caption when it is rendered (`app/captions.py`); you can still edit it in the Review tab.
+
+- **Opening line.** A rotation of short hooks ("CaseOh was NOT ready for this"), picked by clip id so two clips in
+  a row never read the same. In a real game category, game hooks join the rotation. Put your own in
+  *Settings → Opening lines* (one per line, `{name}` and `{game}` allowed).
+- **Hashtags, specific to broad.** `#<streamer>`, `#<game>`, `#<streamer>clips`, `#twitch` / `#kick`, then your
+  *Extra hashtags*, capped at *Max hashtags* (default 5). Handles are cleaned first (`caseoh_` → `#caseoh`).
+- **Per network, at posting time.** TikTok gets `#fyp`; YouTube gets `#shorts`, a title of at most 100 characters
+  (the opening line + `#shorts`), the full caption as description, and the hashtags as video tags; Instagram gets
+  `#reels`. A tag that belongs to another network is removed, and X / Threads / Bluesky length limits are respected.
+- **Template.** *Settings → Caption template*, default `{hook}` + blank line + `{hashtags}`. Also available:
+  `{name}`, `{streamer}`, `{game}`, `{title}` (stream title), `{platform}`.
+
+The app does not know what happens in a clip, so the opening lines are generic by design.
+
 ## Credentials
 
 | Variable | Where | Needed for |
@@ -101,6 +118,8 @@ make e2e           # synthetic stream → clip → Discord → approve → Post 
   live accounts. `python -m app.doctor` tests the selected one with your key; if a path differs, it's one constant.
 - **Upload-Post and Postproxy report success asynchronously.** A clip is marked `posted` once the provider accepts
   the upload; a later per-platform failure on their side is not polled back.
+- **TikTok via Postproxy posts with comments, duet and stitch disabled.** That is Postproxy's default and the
+  switch (`platforms.tiktok.disable_comment`) is only documented for JSON bodies, not for file uploads.
 - **Clipping rights.** Only clip streamers who allow it, or run paid clipping campaigns that authorise you.
   Posting someone else's footage without permission can get accounts struck.
 - YouTube live detection relies on live broadcasts appearing in the channel's uploads playlist

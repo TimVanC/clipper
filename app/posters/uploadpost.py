@@ -4,7 +4,9 @@ Verified against the docs (2026-11):
 - auth header `Authorization: Apikey <key>`, base URL https://api.upload-post.com
 - GET  /api/uploadposts/users -> {"profiles": [{"username", "social_accounts": {platform: {...} | "" | null}}]}
 - POST /api/upload (multipart): `user`, repeated `platform[]`, `video` (file), `title`, `description`,
-  `async_upload`, `external_id`. Sync answer: {"success", "results": {platform: {"success", "error"}}};
+  `async_upload`, `external_id`, and per-platform captions: `<platform>_title` (falls back to `title`),
+  `youtube_description` (falls back to `description`), `tags[]` (YouTube tags). TikTok's caption is its
+  title field; `description` is only used by YouTube, LinkedIn, Facebook and Pinterest. Sync answer: {"success", "results": {platform: {"success", "error"}}};
   async answer: {"success", "request_id"}.
 
 Upload-Post has no per-account id: an upload targets a profile (`user`) plus platform names. Account ids
@@ -14,11 +16,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ..captions import for_platform
 from .base import Poster, PosterError
 
 PATH_USERS = "/api/uploadposts/users"
 PATH_UPLOAD = "/api/upload"
-YOUTUBE_TITLE_MAX = 100
+# platforms with a documented `<platform>_title` override
+TITLE_OVERRIDES = {"tiktok", "instagram", "youtube", "linkedin", "facebook", "x", "pinterest", "bluesky", "threads",
+                   "reddit"}
+YOUTUBE_TAGS_MAX = 15
 
 
 class UploadPostError(PosterError):
@@ -72,8 +78,13 @@ class UploadPost(Poster):
         for profile, platforms in by_profile.items():
             data: dict = {"user": profile, "platform[]": platforms, "title": caption, "description": caption,
                           "async_upload": "true"}
-            if "youtube" in platforms:
-                data["youtube_title"] = caption[:YOUTUBE_TITLE_MAX]
+            for platform in platforms:  # each network gets its own wording, see app/captions.py
+                t = for_platform(caption, platform)
+                if platform == "youtube":
+                    data["youtube_title"], data["youtube_description"] = t.title, t.text
+                    data["tags[]"] = [x for x in t.tags if x != "shorts"][:YOUTUBE_TAGS_MAX]
+                elif platform in TITLE_OVERRIDES:
+                    data[f"{platform}_title"] = t.text
             if external_id:
                 data["external_id"] = external_id
             r = await self.http.post(self.base + PATH_UPLOAD, headers=self._h(), data=data,

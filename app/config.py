@@ -6,6 +6,8 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+from . import captions
+
 LAYOUTS = ("blur", "crop")
 POSTER_PROVIDERS = ("postforme", "uploadpost", "postproxy", "none")
 
@@ -67,6 +69,9 @@ TUNABLES: dict[str, tuple[type, float | None, float | None]] = {
     "delete_raw": (bool, None, None),
     "default_accounts": (str, None, None),
     "caption_template": (str, None, None),
+    "caption_hooks": (str, None, None),
+    "hashtags": (str, None, None),
+    "max_hashtags": (int, 1, 15),
 }
 
 
@@ -116,7 +121,11 @@ class Settings:
     auto_approve: bool = False
     delete_raw: bool = True
     default_accounts: str = ""
-    caption_template: str = "{streamer} went crazy \U0001F525 #{streamer} #clips #fyp"
+    # {hook} {hashtags} {name} {streamer} {game} {title} {platform}; see app/captions.py
+    caption_template: str = captions.DEFAULT_TEMPLATE
+    caption_hooks: str = ""             # one opening line per line; empty = the built-in rotation
+    hashtags: str = "#clips #streamer"  # added after the streamer / game / platform tags
+    max_hashtags: int = 5               # not counting the posting network's own tag (#fyp, #shorts)
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
@@ -171,10 +180,9 @@ class Settings:
             if k == "layout" and val not in LAYOUTS:
                 raise ValueError(f"layout must be one of {LAYOUTS}")
             if k == "caption_template":
-                try:
-                    val.format(streamer="x")
-                except Exception:
-                    raise ValueError("caption_template may only use {streamer}")
+                captions.validate(val.replace("\\n", "\n"))
+            if k == "caption_hooks":
+                captions.validate(captions.DEFAULT_TEMPLATE, val)
             clean[k] = val
         for k, val in clean.items():
             setattr(self, k, val)

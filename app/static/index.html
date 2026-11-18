@@ -161,7 +161,10 @@ const downloadBtn = c => `<a class="btn ghost" href="/api/clips/${c.id}/video?do
 
 const FIELDS = [
   ['default_accounts','Default account ids for the posting provider (comma separated)','text'],
-  ['caption_template','Caption template ({streamer})','text'],
+  ['caption_template','Caption template: {hook} {hashtags} {name} {game} {title} {streamer} {platform}','area'],
+  ['caption_hooks','Opening lines, one per line, rotated per clip ({name}, {game}). Empty = built-in set','area'],
+  ['hashtags','Extra hashtags, after the streamer / game / platform tags','text'],
+  ['max_hashtags','Max hashtags (the network tag #fyp / #shorts is added on top)','number'],
   ['layout','Layout (blur or crop)','text'],
   ['z_threshold','Hype threshold (lower = more clips)','number'],
   ['pre_roll_s','Seconds kept before the moment','number'],
@@ -181,8 +184,9 @@ function settingsHTML() {
   return `<div class="card"><div class="row"><b class="grow">Posting provider: ${esc(p.label || '?')}</b>
       <span class="tag ${p.manual||p.enabled?'posted':'failed'}">${esc(p.provider || '')}</span></div>
       <div class="mut">${pState}. Change it with POSTER_PROVIDER in .env (postforme, uploadpost, postproxy, none, or several separated by commas) and restart.</div></div>
-    <div class="card">${FIELDS.map(([k,l,t])=>`<label>${l}</label><input id="s-${k}" type="${t}" step="any" value="${esc(s[k])}"
-      onfocus="editing=true" onblur="editing=false">`).join('')}
+    <div class="card">${FIELDS.map(([k,l,t])=>`<label>${l}</label>` + (t==='area'
+      ? `<textarea id="s-${k}" onfocus="editing=true" onblur="editing=false">${esc(s[k])}</textarea>`
+      : `<input id="s-${k}" type="${t}" step="any" value="${esc(s[k])}" onfocus="editing=true" onblur="editing=false">`)).join('')}
     <label class="row"><input type="checkbox" id="s-auto_approve" style="width:auto" ${s.auto_approve?'checked':''}> Auto-approve (post without review)</label>
     <div class="row" style="margin-top:12px"><button class="btn grow" onclick="saveSettings()">Save</button>
       <button class="btn ghost" onclick="testDiscord()">Test Discord</button></div></div>`;

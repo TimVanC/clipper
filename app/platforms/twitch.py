@@ -49,5 +49,6 @@ class TwitchClient:
                     continue
                 login = s["user_login"].lower()
                 out[login] = LiveInfo("twitch", login, s.get("title", ""), str(s.get("id", "")),
-                                      f"https://www.twitch.tv/{login}", int(s.get("viewer_count", 0)))
+                                      f"https://www.twitch.tv/{login}", int(s.get("viewer_count", 0)),
+                                      s.get("game_name", "") or "", s.get("user_name", "") or "")
         return out

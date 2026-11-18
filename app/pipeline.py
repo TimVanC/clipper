@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from .captions import build_caption
 from .chat import ChatLog, TwitchChatListener
 from .clipper import ChunkIndex, make_preview, make_thumb, render_clip
 from .config import Settings
@@ -134,7 +135,12 @@ class SessionWorker:
                     await asyncio.to_thread(make_thumb, out, thumb, pl.s.ffmpeg_cmd, min(3.0, (cand.end_s - cand.start_s) / 2))
                 except Exception:
                     thumb = Path("")
-                caption = pl.s.caption_template.format(streamer=self.info.handle)
+                # the watcher holds the newest title/category: the stream may have switched games since it started
+                now = pl.watcher.live.get((self.info.platform, self.info.handle.lower()), self.info)
+                caption = build_caption(pl.s.caption_template, handle=self.info.handle, platform=self.info.platform,
+                                        name=now.name or self.info.name, title=now.title, game=now.game,
+                                        seed=clip_id, hooks=pl.s.caption_hooks, extra_tags=pl.s.hashtags,
+                                        max_tags=pl.s.max_hashtags)
                 pl.db.update_clip(clip_id, path=str(out), thumb=str(thumb) if thumb else "", status="pending",
                                   caption=caption)
                 self.clips += 1
