@@ -58,6 +58,7 @@ def _crop_to(box: Box, w: int, h: int) -> str:
 
 
 SEEK_MARGIN = 8.0  # seconds decoded before each cut, so the cut never lands before the first keyframe
+CLASSIC_TOP = 640  # 'classic' layout: top of the full frame (a 16:9 stream fills 640-1248 of 1920)
 
 
 def build_filtergraph(n_pieces: int, layout: str, norm: tuple[int, int] | None = None,
@@ -89,6 +90,8 @@ def build_filtergraph(n_pieces: int, layout: str, norm: tuple[int, int] | None =
                      f"[game]{_crop_to(game, 1080, 1152)}[bot];[top][bot]vstack=inputs=2,format=yuv420p[vout]")
     elif layout == "crop":
         parts.append("[cv]scale=-2:1920,crop=1080:1920,format=yuv420p[vout]")
+    elif layout == "classic":  # the whole 16:9 frame on black, room above it for a text line
+        parts.append(f"[cv]scale=1080:-2,setsar=1,pad=1080:1920:0:{CLASSIC_TOP}:black,format=yuv420p[vout]")
     else:  # blur: sharp 16:9 stream centred over a blurred, zoomed copy (the standard clip look)
         parts.append(
             "[cv]split=2[bg][fg];"
@@ -103,7 +106,8 @@ def build_filtergraph(n_pieces: int, layout: str, norm: tuple[int, int] | None =
 
 def render_clip(pieces: list[Piece], out_path: str | Path, layout: str = "blur", ffmpeg: str = "ffmpeg",
                 split: tuple[Box, Box] | None = None) -> None:
-    """layout: blur | crop | split (needs split=(cam box, game box), see app/facecam.py; without it: blur)."""
+    """layout: blur | crop | classic (full frame on black) | split (needs split=(cam box, game box),
+    see app/facecam.py; without it: blur)."""
     if not pieces:
         raise ValueError("no media pieces for this window")
     out_path = Path(out_path)

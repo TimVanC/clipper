@@ -30,6 +30,7 @@ def settings(tmp_path) -> Settings:
     s = Settings(data_dir=tmp_path / "data")
     s.data_dir.mkdir(parents=True, exist_ok=True)
     s.chunk_seconds = 30
+    s.headline_mode = "off"  # no speech model in the pipeline tests; headlines have their own tests
     s.warmup_s = 30
     s.delete_raw = False
     s.default_accounts = "spc_1"

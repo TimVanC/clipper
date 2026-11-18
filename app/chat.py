@@ -48,17 +48,26 @@ def parse_privmsg(line: str) -> tuple[str, str] | None:
 class ChatLog:
     """Time-stamped weighted message counts; query as a per-second array."""
 
-    def __init__(self, max_age_s: float = 4 * 3600):
+    def __init__(self, max_age_s: float = 4 * 3600, keep_text_s: float = 1800):
         self._events: deque[tuple[float, float]] = deque()
-        self.max_age_s = max_age_s
+        self._texts: deque[tuple[float, str]] = deque()  # recent messages, for the clip headline
+        self.max_age_s, self.keep_text_s = max_age_s, keep_text_s
         self.total = 0
 
-    def add(self, ts: float, weight: float = 1.0) -> None:
+    def add(self, ts: float, weight: float = 1.0, text: str = "") -> None:
         self._events.append((ts, weight))
         self.total += 1
         cutoff = ts - self.max_age_s
         while self._events and self._events[0][0] < cutoff:
             self._events.popleft()
+        if text:
+            self._texts.append((ts, text[:200]))
+            while self._texts and self._texts[0][0] < ts - self.keep_text_s:
+                self._texts.popleft()
+
+    def messages(self, start_ts: float, end_ts: float, limit: int = 60) -> list[str]:
+        """Chat lines sent between two wall-clock times (most recent `limit`)."""
+        return [t for ts, t in list(self._texts) if start_ts <= ts <= end_ts][-limit:]
 
     def series(self, start_ts: float, n_seconds: int) -> np.ndarray:
         out = np.zeros(n_seconds, dtype=np.float64)
@@ -108,7 +117,7 @@ class TwitchChatListener:
                         continue
                     msg = parse_privmsg(line)
                     if msg:
-                        self.chatlog.add(self.clock(), hype_weight(msg[1]))
+                        self.chatlog.add(self.clock(), hype_weight(msg[1]), msg[1])
             except asyncio.CancelledError:
                 raise
             except Exception as e:

@@ -89,6 +89,24 @@ else falls back to the blurred layout, so a green-screen streamer with no cam bo
 gets wrong, *Settings → Pin a facecam* takes `handle=x,y,w,h` (fractions of the frame, e.g. `caseoh_=0,0.12,0.21,0.27`).
 Layout `split` forces the split whatever the category; `blur` and `crop` are the old fixed layouts.
 
+## On-screen headline
+
+The line at the seam between cam and game ("YOU CAN'T STEAL YOUR NEIGHBORS CARS IN GTA6"), black bold text on
+a white rounded box. `app/headline.py`:
+
+1. **Transcribe** the clip locally with Whisper (`faster-whisper`, model `WHISPER_MODEL`, default `small.en`,
+   downloaded once, ~0.5 GB; a 60 s clip takes ~3-10 s on CPU).
+2. **Write the headline** with Claude (`ANTHROPIC_API_KEY`): the transcript, the Twitch chat around the peak,
+   streamer, game and stream title go in; a real quote or a theme line comes out (JSON), or nothing when the clip
+   has nothing good. It is told to use only what was said. Without a key there is no headline;
+   *Settings → headline_mode* `local` picks the most emphatic line instead (free, but it can't tell the streamer
+   from game dialogue).
+3. **Burn it in**: the text-free render is kept as `<id>_base.mp4`; the posted clip is that plus the headline.
+   Edit the text in Review and press *Update video* (or just Approve) to re-burn it. No emoji in burnt-in text:
+   they'd be drawn in this computer's emoji style instead of the viewer's.
+
+The headline also becomes the caption's first line (and so the YouTube title).
+
 ## Captions and hashtags
 
 Each clip gets a caption when it is rendered (`app/captions.py`); you can still edit it in the Review tab.

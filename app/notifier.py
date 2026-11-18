@@ -54,7 +54,8 @@ class DiscordNotifier:
         payload = {"content": f"\U0001F3AC **New clip ready** from {clip['handle']} - review and approve:",
                    "embeds": [{"title": f"⭐ {rating:.1f}/10 ({rating_label(rating)}) · {clip['handle']} "
                                         f"clip #{clip['id']} ({length:.0f}s)", "url": review,
-                               "description": f"Hype score **{clip['score']:.1f}** (audio z {clip['audio_z']:.1f}, "
+                               "description": (f"> {clip['headline']}\n" if clip.get("headline") else "")
+                                              + f"Hype score **{clip['score']:.1f}** (audio z {clip['audio_z']:.1f}, "
                                               f"chat z {clip['chat_z']:.1f})\n[Open review page]({review})",
                                "color": 0x43A047}]}
         full = Path(clip["path"]) if clip.get("path") else None

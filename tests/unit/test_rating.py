@@ -64,3 +64,5 @@ def test_posts_cut_off_by_a_restart_are_failed_not_retried(tmp_path):
     assert stuck["status"] == "failed" and "check your profiles" in stuck["post_error"]
     assert [db.get_clip(i)["status"] for i in ids[1:]] == ["posted", "pending"]
     assert db.fail_interrupted_posts() == []
+    cut = db.add_clip(1, "twitch", "x", 0, 61, 50, 3.0, 2.0, 1.0)  # new clips start as 'rendering'
+    assert db.fail_interrupted_renders() == [cut] and db.get_clip(cut)["status"] == "failed"

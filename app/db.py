@@ -24,7 +24,12 @@ CREATE INDEX IF NOT EXISTS idx_clips_status ON clips(status);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 """
 
-CLIP_STATUSES = ("rendering", "pending", "posting", "posted", "approved", "failed", "rejected")
+# columns added after the first release: headline = on-screen text burnt in at `seam` (pixel row);
+# the text-free render is kept next to the clip as <id>_base.mp4 so the headline can be changed
+ADDED_COLUMNS = {"headline": "TEXT NOT NULL DEFAULT ''", "seam": "INTEGER NOT NULL DEFAULT 0",
+                 "transcript": "TEXT NOT NULL DEFAULT ''"}
+
+CLIP_STATUSES =("rendering", "pending", "posting", "posted", "approved", "failed", "rejected")
 
 
 class Database:
@@ -36,6 +41,10 @@ class Database:
         self._lock = threading.RLock()
         with self._lock:
             self._conn.executescript(SCHEMA)
+            have = {r["name"] for r in self._conn.execute("PRAGMA table_info(clips)")}
+            for col, decl in ADDED_COLUMNS.items():  # databases made by older versions
+                if col not in have:
+                    self._conn.execute(f"ALTER TABLE clips ADD COLUMN {col} {decl}")
             self._conn.commit()
 
     # ---- helpers -------------------------------------------------
@@ -111,7 +120,7 @@ class Database:
         if not fields:
             return
         allowed = {"path", "thumb", "status", "caption", "accounts", "post_id", "post_error",
-                   "decided_at", "posted_at"}
+                   "decided_at", "posted_at", "headline", "seam", "transcript"}
         bad = set(fields) - allowed
         if bad:
             raise ValueError(f"cannot update {bad}")
@@ -134,6 +143,12 @@ class Database:
                         (since_ts,))
         return int(row["n"]) if row else 0
 
+    def count_uploads_since(self, since_ts: float) -> int:
+        """Uploads, not clips: a clip posted in all its versions ('headline=..,plain=..,full=..') counts each."""
+        rows = self._all("SELECT post_id FROM clips WHERE status IN ('posted','posting') AND decided_at>=?",
+                         (since_ts,))
+        return sum(max(1, (r["post_id"] or "").count("=")) for r in rows)
+
     def fail_interrupted_posts(self) -> list[int]:
         """Clips left in 'posting' by a stopped app. They may have reached some networks, so they become
         'failed' with a note rather than being retried (a retry could post twice)."""
@@ -142,6 +157,14 @@ class Database:
             self._exec(f"UPDATE clips SET status='failed', post_error=? WHERE id IN ({','.join('?' * len(ids))})",
                        ("the app was stopped while posting: check your profiles before retrying, "
                         "it may already be up on some of them", *ids))
+        return ids
+
+    def fail_interrupted_renders(self) -> list[int]:
+        """Clips left in 'rendering' by a stopped app: nothing will ever finish them."""
+        ids = [r["id"] for r in self._all("SELECT id FROM clips WHERE status='rendering'")]
+        if ids:
+            self._exec(f"UPDATE clips SET status='failed', post_error=? WHERE id IN ({','.join('?' * len(ids))})",
+                       ("render was cut off when the app stopped", *ids))
         return ids
 
     def counts(self) -> dict[str, int]:

@@ -10,6 +10,7 @@ from . import captions
 
 LAYOUTS = ("auto", "split", "blur", "crop")
 CATEGORY_PLATFORMS = ("twitch", "kick")
+HEADLINE_MODES = ("auto", "claude", "local", "off")
 POSTER_PROVIDERS = ("postforme", "uploadpost", "postproxy", "none")
 
 
@@ -107,7 +108,11 @@ TUNABLES: dict[str, tuple[type, float | None, float | None]] = {
     "category_languages": (str, None, None),
     "category_exclude": (str, None, None),
     "category_start": (str, None, None),
+    "headline_mode": (str, None, None),
     "auto_approve": (bool, None, None),
+    "auto_post_min_rating": (float, 0, 10),
+    "auto_post_version": (str, None, None),
+    "full_frame_version": (bool, None, None),
     "delete_raw": (bool, None, None),
     "default_accounts": (str, None, None),
     "caption_template": (str, None, None),
@@ -142,6 +147,8 @@ class Settings:
     streamlink_cmd: str = "streamlink"
     ffmpeg_cmd: str = "ffmpeg"
     discord_max_upload_mb: float = 8.0
+    anthropic_api_key: str = ""     # Claude writes the on-screen headline when set
+    whisper_model: str = "small.en"  # speech-to-text model for the headline (tiny.en/base.en: faster, rougher)
 
     # tunables
     poll_seconds: int = 120
@@ -170,7 +177,13 @@ class Settings:
     category_languages: str = "en"  # comma separated; empty = any language
     category_exclude: str = ""      # handles never to pick from a category
     category_start: str = ""        # don't auto-watch before this time ("2026-11-18 06:00"), e.g. a game's launch
+    # on-screen headline at the cam/game seam: auto = Claude when ANTHROPIC_API_KEY is set, else none;
+    # claude | local (free: the most emphatic line said, can't tell the streamer from game dialogue) | off
+    headline_mode: str = "auto"
     auto_approve: bool = False
+    auto_post_min_rating: float = 0.0  # > 0: post clips rated at least this (0-10) without review
+    auto_post_version: str = "headline"  # which version auto-posting uses: headline | plain | full | all
+    full_frame_version: bool = True      # also render the full-frame version of each clip (one more render)
     delete_raw: bool = True
     default_accounts: str = ""
     # {hook} {hashtags} {name} {streamer} {game} {title} {platform}; see app/captions.py
@@ -204,6 +217,8 @@ class Settings:
             streamlink_cmd=e.get("STREAMLINK_CMD", "streamlink"),
             ffmpeg_cmd=e.get("FFMPEG_CMD", "ffmpeg"),
             discord_max_upload_mb=float(e.get("DISCORD_MAX_UPLOAD_MB") or 8.0),
+            anthropic_api_key=e.get("ANTHROPIC_API_KEY", ""),
+            whisper_model=e.get("WHISPER_MODEL", "small.en") or "small.en",
         )
         overrides = {k: e[k.upper()] for k in TUNABLES if k.upper() in e}
         s.update(overrides)
@@ -238,6 +253,10 @@ class Settings:
                 parse_categories(val)
             if k == "category_start":
                 parse_start(val)
+            if k == "auto_post_version" and val not in ("headline", "plain", "full", "all"):
+                raise ValueError("auto_post_version must be headline, plain, full or all")
+            if k == "headline_mode" and val not in HEADLINE_MODES:
+                raise ValueError(f"headline_mode must be one of {', '.join(HEADLINE_MODES)}")
             if k == "caption_template":
                 captions.validate(val.replace("\\n", "\n"))
             if k == "caption_hooks":

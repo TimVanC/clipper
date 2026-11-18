@@ -67,7 +67,14 @@
 <script>
 const $ = (s, el=document) => el.querySelector(s);
 let state = null, accounts = null, tab = 'review', clips = [], highlight = null, editing = false;
-const picked = {}, drafts = {};  // account ticks and caption edits per clip, kept across refreshes
+const picked = {}, drafts = {}, heads = {};  // account ticks, caption and headline edits, kept across refreshes
+const verSel = {};  // clip id -> the version chosen in Review: headline | plain | full
+const ver = id => verSel[id] || 'headline';
+const versionsOf = c => [['headline', c.headline ? 'With headline' : 'Split'],
+  ...(c.has_plain ? [['plain', 'Without']] : []), ...(c.has_full ? [['full', 'Full frame']] : [])];
+const choicesOf = c => versionsOf(c).length > 1 ? [...versionsOf(c), ['all', 'All versions']] : versionsOf(c);
+const shown = id => ver(id) === 'all' ? 'headline' : ver(id);  // 'all' previews the headline version
+function pickVersion(id, v) { verSel[id] = v; render(true); }
 let lastHTML = '';
 const playing = () => [...document.querySelectorAll('video')].some(v => !v.paused && !v.ended);
 const stars = r => '★'.repeat(Math.round(r/2)) + '☆'.repeat(5 - Math.round(r/2));
@@ -119,7 +126,21 @@ function reviewHTML() {
         <span class="tag rate ${esc(c.rating_label)}" title="How hard audio and chat reacted, vs the rest of the stream">
           ${stars(c.rating)} ${c.rating.toFixed(1)} ${esc(c.rating_label)}</span>
         <span class="tag">${(c.end_s-c.start_s)|0}s</span></div>
-      <video controls playsinline preload="metadata" src="/api/clips/${c.id}/video" poster="/api/clips/${c.id}/thumb"></video>
+      ${versionsOf(c).length > 1 ? `<div class="row" style="margin:6px 0">
+        ${choicesOf(c).map(([v, label]) => `<button class="btn ${ver(c.id) === v ? '' : 'ghost'}"
+          onclick="pickVersion(${c.id}, '${v}')">${label}</button>`).join('')}
+        <span class="mut grow" style="text-align:right">${ver(c.id) === 'all'
+          ? 'Approve posts every version, each as its own post' : 'Approve posts the version shown'}</span></div>` : ''}
+      <video controls playsinline preload="metadata"
+        src="/api/clips/${c.id}/video?version=${shown(c.id)}&h=${encodeURIComponent(c.headline||'')}"
+        poster="/api/clips/${c.id}/thumb?h=${encodeURIComponent(c.headline||'')}"></video>
+      ${versionsOf(c).length > 1 ? `<div class="row" style="margin-top:4px">
+        ${versionsOf(c).map(([v, label]) => `<a class="btn ghost" href="/api/clips/${c.id}/video?download=1&version=${v}"
+          download>⬇ ${label}</a>`).join('')}</div>` : ''}
+      <label>On-screen text <span class="mut">(burnt in between cam and game; empty = none)</span></label>
+      <div class="row"><input id="hl-${c.id}" class="grow" value="${esc(heads[c.id] ?? c.headline ?? '')}"
+          onfocus="editing=true" onblur="editing=false" oninput="heads[${c.id}]=this.value">
+        <button class="btn ghost" onclick="applyHeadline(${c.id})">Update video</button></div>
       <label>Caption</label><textarea id="cap-${c.id}" onfocus="editing=true" onblur="editing=false"
         oninput="drafts[${c.id}]=this.value">${esc(drafts[c.id] ?? c.caption)}</textarea>
       ${manual ? '<div class="mut" style="margin-top:8px">Manual mode: Approve marks the clip, then download it and post it yourself.</div>' : `<label>Post to</label>
@@ -183,6 +204,9 @@ const downloadBtn = c => `<a class="btn ghost" href="/api/clips/${c.id}/video?do
 
 const FIELDS = [
   ['default_accounts','Default account ids for the posting provider (comma separated)','text'],
+  ['auto_post_min_rating','Auto-post clips rated at least (0-10, 0 = never; the daily cap still applies)','number'],
+  ['auto_post_version','Version auto-posting uses: headline, plain (no text), full (full frame) or all (each as its own post)','text'],
+  ['headline_mode','On-screen headline: auto (Claude when ANTHROPIC_API_KEY is set, else none), claude, local (free, rough) or off','text'],
   ['caption_template','Caption template: {hook} {hashtags} {name} {game} {title} {streamer} {platform}','area'],
   ['caption_hooks','Opening lines, one per line, rotated per clip ({name}, {game}). Empty = built-in set','area'],
   ['hashtags','Extra hashtags, after the streamer / game / platform tags','text'],
@@ -204,7 +228,7 @@ const FIELDS = [
   ['max_clips_per_hour','Max clips per hour','number'],
   ['audio_weight','Audio weight','number'], ['chat_weight','Chat weight','number'],
   ['poll_seconds','Live-check interval (s)','number'], ['chunk_seconds','Recording chunk length (s)','number'],
-  ['max_posts_per_day','Max posts per day','number'],
+  ['max_posts_per_day','Max uploads per day (each version posted counts; Upload-Post allows 15 TikTok posts a day)','number'],
 ];
 function settingsHTML() {
   const s = state.settings, p = state.poster || {};
@@ -223,12 +247,23 @@ function settingsHTML() {
 
 async function approve(id) {
   const caption = $('#cap-'+id)?.value;
+  const headline = $('#hl-'+id)?.value;
   const boxes = document.querySelectorAll('.acct-'+id);
   // the ticked accounts, even none (the server then refuses); null only where no boxes are shown (History retry)
   const accts = boxes.length ? [...boxes].filter(x=>x.checked).map(x=>x.value) : null;
-  try { await api(`/api/clips/${id}/approve`, {method:'POST', body:{caption, accounts: accts}});
-        delete picked[id]; delete drafts[id];
+  const version = ver(id);
+  if (headline !== undefined && version !== 'plain') toast('Approving… (updating the on-screen text first if you changed it)');
+  try { await api(`/api/clips/${id}/approve`, {method:'POST', body:{caption, accounts: accts, headline, version}});
+        delete verSel[id];
+        delete picked[id]; delete drafts[id]; delete heads[id];
         toast(isManual() ? 'Approved. Download it from History' : 'Approved: posting…'); } catch(e) { toast(e.message); } refresh(true);
+}
+async function applyHeadline(id) {
+  const headline = $('#hl-'+id)?.value ?? '';
+  toast('Updating the video… (about 15 s)');
+  try { await api(`/api/clips/${id}/headline`, {method:'POST', body:{headline}}); delete heads[id];
+        toast('Updated'); } catch(e) { toast(e.message); }
+  refresh(true);
 }
 async function reject(id) { try { await api(`/api/clips/${id}/reject`, {method:'POST'}); } catch(e){ toast(e.message);} refresh(true); }
 async function addStreamer() {

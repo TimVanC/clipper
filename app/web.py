@@ -27,6 +27,13 @@ class StreamerIn(BaseModel):
 class ApproveIn(BaseModel):
     caption: str | None = None
     accounts: list[str] | None = None
+    headline: str | None = None  # on-screen text; burnt in again first when it was edited
+    plain: bool = False          # post the version without the on-screen headline
+    version: str = "headline"    # headline | plain | full
+
+
+class HeadlineIn(BaseModel):
+    headline: str = ""
 
 
 def create_app(pl: Pipeline, start_pipeline: bool = True) -> FastAPI:
@@ -94,7 +101,14 @@ def create_app(pl: Pipeline, start_pipeline: bool = True) -> FastAPI:
     @app.post("/api/clips/{cid}/approve", dependencies=[Depends(auth)])
     async def approve(cid: int, body: ApproveIn) -> dict:
         try:
-            return _public(await pl.approve(cid, body.caption, body.accounts))
+            return _public(await pl.approve(cid, body.caption, body.accounts, body.headline, body.plain, body.version))
+        except ClipError as e:
+            raise HTTPException(400, str(e))
+
+    @app.post("/api/clips/{cid}/headline", dependencies=[Depends(auth)])
+    async def set_headline(cid: int, body: HeadlineIn) -> dict:
+        try:
+            return _public(await pl.set_headline(cid, body.headline))
         except ClipError as e:
             raise HTTPException(400, str(e))
 
@@ -106,14 +120,20 @@ def create_app(pl: Pipeline, start_pipeline: bool = True) -> FastAPI:
             raise HTTPException(400, str(e))
 
     @app.get("/api/clips/{cid}/video", dependencies=[Depends(auth)])
-    async def video(cid: int, download: bool = False):
+    async def video(cid: int, download: bool = False, plain: bool = False, version: str = "headline"):
+        """version: headline (main) | plain (no on-screen text) | full (full frame); plain=1 = version=plain."""
         c = pl.db.get_clip(cid)
         if not c or not c.get("path") or not Path(c["path"]).exists():
             raise HTTPException(404, "no video")
+        try:
+            path = pl.version_file(c, "plain" if plain else version)
+        except ClipError as e:
+            raise HTTPException(400, str(e))
         if download:  # Content-Disposition: attachment, for manual posting
             safe = re.sub(r"[^A-Za-z0-9_.-]", "_", c.get("handle") or "clip")
-            return FileResponse(c["path"], media_type="video/mp4", filename=f"{safe}-clip-{cid}.mp4")
-        return FileResponse(c["path"], media_type="video/mp4")
+            suffix = {pl.base_path(cid): "-no-headline", pl.full_path(cid): "-full-frame"}.get(path, "")
+            return FileResponse(path, media_type="video/mp4", filename=f"{safe}-clip-{cid}{suffix}.mp4")
+        return FileResponse(path, media_type="video/mp4")
 
     @app.get("/api/clips/{cid}/thumb", dependencies=[Depends(auth)])
     async def thumb(cid: int):
@@ -150,6 +170,9 @@ def create_app(pl: Pipeline, start_pipeline: bool = True) -> FastAPI:
 
 def _public(c: dict) -> dict:
     r = clip_rating(c.get("score"), c.get("audio_z"), c.get("chat_z"))
-    return {k: v for k, v in c.items() if k not in ("path", "thumb")} | {
+    base = Path(c["path"]).with_name(f"{c['id']}_base.mp4") if c.get("path") else None
+    return {k: v for k, v in c.items() if k not in ("path", "thumb", "transcript")} | {
         "has_video": bool(c.get("path")), "has_thumb": bool(c.get("thumb")),
+        "has_plain": bool(base and base.exists() and c.get("headline")),
+        "has_full": bool(base and base.with_name(f"{c['id']}_full.mp4").exists()),
         "rating": r, "rating_label": rating_label(r)}
