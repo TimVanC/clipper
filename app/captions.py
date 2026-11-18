@@ -26,6 +26,10 @@ GAME_HOOKS = [  # only used while the stream is in a real game category
     "{name} on {game} is something else \U0001F62D",
     "{game} broke {name} \U0001F480",
 ]
+GAME_NAMES = {  # what people call the game, for the {game} in opening lines
+    "grand theft auto vi": "GTA 6", "grand theft auto v": "GTA 5", "call of duty: warzone": "Warzone",
+    "counter-strike": "CS2", "league of legends": "League",
+}
 NOT_A_GAME = {"", "just chatting", "irl", "special events", "talk shows & podcasts", "music", "sports", "asmr"}
 GAME_TAGS = {  # categories whose plain name makes a poor hashtag
     "grand theft auto v": "gta", "grand theft auto vi": "gta6", "call of duty: warzone": "warzone",
@@ -118,7 +122,8 @@ def build_caption(template: str = DEFAULT_TEMPLATE, *, handle: str, platform: st
                   max_tags: int = 5) -> str:
     """seed (the clip id) rotates through the hooks so consecutive clips don't read the same."""
     who = display_name(handle, name)
-    base = {"streamer": handle, "name": who, "game": clean_category(game), "title": (title or "").strip(),
+    g = clean_category(game)
+    base = {"streamer": handle, "name": who, "game": GAME_NAMES.get(g.lower(), g), "title": (title or "").strip(),
             "platform": platform}
     pool = _hooks(hooks, game)
     try:

@@ -57,20 +57,30 @@ def _crop_to(box: Box, w: int, h: int) -> str:
             f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1")
 
 
+SEEK_MARGIN = 8.0  # seconds decoded before each cut, so the cut never lands before the first keyframe
+
+
 def build_filtergraph(n_pieces: int, layout: str, norm: tuple[int, int] | None = None,
-                      split: tuple[Box, Box] | None = None) -> str:
+                      split: tuple[Box, Box] | None = None,
+                      trims: list[tuple[float, float]] | None = None) -> str:
     """norm=None: all pieces already share a size (the normal case, no re-scaling needed).
     norm=(w, h): letterbox every piece to that size first (stream changed resolution mid-way).
-    split=(cam box, game box): layout 'split', cam on top (1080x768) and game below (1080x1152)."""
+    split=(cam box, game box): layout 'split', cam on top (1080x768) and game below (1080x1152).
+    trims[i]=(start, duration): cut picture AND sound of piece i at exactly the same point (see render_clip)."""
     parts = []
     for i in range(n_pieces):
+        cut_v = cut_a = ""
+        if trims:
+            start, dur = trims[i]
+            cut_v = f"trim=start={start:.3f}:duration={dur:.3f},setpts=PTS-STARTPTS,"
+            cut_a = f"atrim=start={start:.3f}:duration={dur:.3f},asetpts=PTS-STARTPTS,"
         if norm:
             w, h = norm
-            v = (f"[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,"
+            v = (f"[{i}:v]{cut_v}scale={w}:{h}:force_original_aspect_ratio=decrease,"
                  f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v{i}]")
         else:
-            v = f"[{i}:v]setsar=1,fps=30[v{i}]"
-        parts.append(v + f";[{i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a{i}]")
+            v = f"[{i}:v]{cut_v}setsar=1,fps=30[v{i}]"
+        parts.append(v + f";[{i}:a]{cut_a}aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a{i}]")
     joined = "".join(f"[v{i}][a{i}]" for i in range(n_pieces))
     parts.append(f"{joined}concat=n={n_pieces}:v=1:a=1[cv][aout]")
     if layout == "split" and split:
@@ -101,9 +111,15 @@ def render_clip(pieces: list[Piece], out_path: str | Path, layout: str = "blur",
     sizes = {probe_size(p) for p, _, _ in pieces}
     norm = None if len(sizes) == 1 and (0, 0) not in sizes else (1920, 1080)
     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
+    trims = []
     for path, ss, dur in pieces:
-        cmd += ["-ss", f"{ss:.3f}", "-t", f"{dur:.3f}", "-i", path]
-    cmd += ["-filter_complex", build_filtergraph(len(pieces), layout, norm, split),
+        # Seeking an MPEG-TS lands the picture on the next keyframe (up to a GOP, ~2 s, late) while the sound
+        # starts at once: the first frame then sits frozen under live audio. So seek a margin early (both
+        # streams start before the cut) and trim both to the same instant in the filter graph.
+        start = max(0.0, ss - SEEK_MARGIN)
+        trims.append((ss - start, dur))
+        cmd += ["-ss", f"{start:.3f}", "-t", f"{ss - start + dur + 0.5:.3f}", "-i", path]
+    cmd += ["-filter_complex", build_filtergraph(len(pieces), layout, norm, split, trims),
             "-map", "[vout]", "-map", "[aout]",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-r", "30",
             "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(out_path)]

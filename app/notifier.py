@@ -7,6 +7,8 @@ from pathlib import Path
 
 import httpx
 
+from .rating import clip_rating, rating_label
+
 log = logging.getLogger("clipper.discord")
 
 
@@ -48,8 +50,10 @@ class DiscordNotifier:
     async def notify_clip(self, clip: dict, preview: Path | None = None) -> bool:
         review = f"{self.public_base_url}/#clip-{clip['id']}"
         length = clip["end_s"] - clip["start_s"]
+        rating = clip_rating(clip.get("score"), clip.get("audio_z"), clip.get("chat_z"))
         payload = {"content": f"\U0001F3AC **New clip ready** from {clip['handle']} - review and approve:",
-                   "embeds": [{"title": f"{clip['handle']} clip #{clip['id']} ({length:.0f}s)", "url": review,
+                   "embeds": [{"title": f"⭐ {rating:.1f}/10 ({rating_label(rating)}) · {clip['handle']} "
+                                        f"clip #{clip['id']} ({length:.0f}s)", "url": review,
                                "description": f"Hype score **{clip['score']:.1f}** (audio z {clip['audio_z']:.1f}, "
                                               f"chat z {clip['chat_z']:.1f})\n[Open review page]({review})",
                                "color": 0x43A047}]}

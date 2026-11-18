@@ -67,7 +67,12 @@ streaming it**. In *Settings → Auto-watch categories* put `Grand Theft Auto VI
 - It records up to *Category streams recorded at once* (default 3, both sites together) that have at least
   *min viewers* (default 1000) and speak one of *languages* (default `en`). Streamers you added by hand don't use a slot.
 - A picked stream keeps its slot until it ends or switches to another game; dropping a few places in the
-  ranking does not stop it. Then the next biggest stream takes the slot. *never pick these handles* skips some.
+  ranking does not stop it. Then the next biggest stream takes the slot. One exception: a waiting stream with at
+  least twice the viewers of the smallest pick takes that slot (one swap per poll), so a pre-launch countdown can't
+  hold a slot while launch-day streams with far more viewers wait. *never pick these handles* skips some.
+- *Category: start at* holds the auto-watch until a time, e.g. a game's launch (`2026-11-18 06:00` in this
+  computer's time zone, or ISO with an offset). Until then nothing is picked, so countdown streams aren't clipped.
+  GTA VI unlocks at midnight local time per region: New Zealand first (06:00 ET on Nov 18), New York at 00:00 ET Nov 19.
 - The Live tab marks these streams `auto · <category>`. Kick's `Grand Theft Auto VI (GTA)` matches `Grand Theft Auto VI`.
 
 Each auto stream is a full recording (2-4 GB/hour of disk while live, plus CPU for analysis and rendering).

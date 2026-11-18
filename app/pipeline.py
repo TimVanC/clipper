@@ -12,7 +12,7 @@ from typing import Callable
 from .captions import build_caption
 from .chat import ChatLog, TwitchChatListener
 from .clipper import ChunkIndex, make_preview, make_thumb, render_clip
-from .config import Settings, parse_categories, split_list
+from .config import Settings, parse_categories, parse_start, split_list
 from .facecam import choose_layout
 from .db import Database
 from .detector import DetectorConfig, HypeDetector, audio_db_per_second, decode_audio, SR
@@ -31,6 +31,18 @@ def default_recorder_factory(info: LiveInfo, out_dir: Path, s: Settings) -> Reco
 
 def default_chat_factory(info: LiveInfo, chatlog: ChatLog):
     return TwitchChatListener(info.handle, chatlog) if info.platform == "twitch" else None
+
+
+def category_watch_from(s: Settings, now: float) -> CategoryWatch | None:
+    """The category auto-watch in effect at `now`: None when it is off or its start time hasn't come yet."""
+    cats = parse_categories(s.watch_categories)
+    if not cats or s.category_streams <= 0:
+        return None
+    start = parse_start(s.category_start)
+    if start is not None and now < start:
+        return None
+    return CategoryWatch(cats, s.category_streams, s.category_min_viewers,
+                         split_list(s.category_languages), set(split_list(s.category_exclude)))
 
 
 class ClipError(ValueError):
@@ -190,11 +202,7 @@ class Pipeline:
             category_watch=self.category_watch)
 
     def category_watch(self) -> CategoryWatch | None:
-        cats = parse_categories(self.s.watch_categories)
-        if not cats or self.s.category_streams <= 0:
-            return None
-        return CategoryWatch(cats, self.s.category_streams, self.s.category_min_viewers,
-                             split_list(self.s.category_languages), set(split_list(self.s.category_exclude)))
+        return category_watch_from(self.s, time.time())
 
     # ---- lifecycle -------------------------------------------------
     def load_overrides(self) -> None:
@@ -206,6 +214,9 @@ class Pipeline:
 
     async def start(self) -> None:
         self.load_overrides()
+        stuck = self.db.fail_interrupted_posts()
+        if stuck:
+            log.warning("clips %s were posting when the app stopped; marked failed for review", stuck)
         self._watch_task = asyncio.create_task(self.watcher.run(lambda: self.s.poll_seconds))
 
     async def stop(self) -> None:
@@ -325,5 +336,6 @@ class Pipeline:
                          "chat": bool(w and w.chat and getattr(w.chat, "connected", False)),
                          "game": info.game, "auto": self.watcher.auto.get((plat, handle), "")})
         return {"live": live, "streamers": self.db.list_streamers(), "counts": self.db.counts(),
-                "configured": self.s.configured(), "poster": self.poster.info(), "watcher": {"last_poll": self.watcher.last_poll,
+                "configured": self.s.configured(), "poster": self.poster.info(),
+                "category_start_ts": parse_start(self.s.category_start), "watcher": {"last_poll": self.watcher.last_poll,
                                                                "errors": self.watcher.last_error}}

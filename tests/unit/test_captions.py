@@ -43,6 +43,9 @@ def test_build_caption_rotates_hooks_and_never_puts_underscores_in_tags():
     # game hooks join the rotation only in a real game category
     pool = {build_caption(handle="x", game="Fortnite", seed=i).splitlines()[0] for i in range(10)}
     assert any("Fortnite" in h for h in pool)
+    gta = {build_caption(handle="x", game="Grand Theft Auto VI (GTA)", seed=i) for i in range(10)}
+    assert any("GTA 6" in c.splitlines()[0] for c in gta) and not any("Grand Theft" in c for c in gta)
+    assert all("#gta6" in c for c in gta)
     assert not any("Just Chatting" in build_caption(handle="x", game="Just Chatting", seed=i).splitlines()[0]
                    for i in range(10))
 

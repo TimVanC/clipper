@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -105,6 +106,40 @@ async def test_render_clip_across_chunk_boundaries(synthetic_mp4, tmp_path, layo
     thumb = tmp_path / "t.jpg"
     make_thumb(out, thumb)
     assert thumb.stat().st_size > 500
+
+
+def test_clip_cut_between_keyframes_starts_moving_and_stays_in_sync(tmp_path):
+    """A stream with a keyframe every 2 s, a white flash and a beep both at 13.0 s, cut at 12.3 s (mid-GOP).
+    The clip must not open on a frozen frame, and the flash and the beep must still land together."""
+    ts = tmp_path / "gop.ts"
+    subprocess.run(["ffmpeg", "-y", "-v", "error",
+                    "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=20",
+                    "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000:duration=20",
+                    "-vf", "drawbox=c=white:t=fill:enable='between(t,13,13.3)'",
+                    "-af", "volume=0:enable='lt(t,13)+gt(t,13.3)'",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-g", "60", "-keyint_min", "60", "-sc_threshold", "0",
+                    "-c:a", "aac", "-f", "mpegts", str(ts)], check=True)
+    out = tmp_path / "cut.mp4"
+    render_clip([(str(ts), 12.3, 3.0)], out, "blur")
+    assert probe_duration(out) == pytest.approx(3.0, abs=0.1)
+    freeze = subprocess.run(["ffmpeg", "-v", "error", "-i", str(out), "-vf",
+                             "freezedetect=n=0.001:d=0.1,metadata=mode=print:file=-", "-an", "-f", "null", "-"],
+                            capture_output=True, text=True).stdout
+    starts = [float(t) for t in re.findall(r"freeze_start=([\d.]+)", freeze)]
+    assert all(t > 0.5 for t in starts), starts  # moving from the first frame (the solid flash at 0.7 s is fine)
+    # when does the flash show and the beep sound in the clip? (expected: 0.7 s, together)
+    lum = subprocess.run(["ffmpeg", "-v", "error", "-i", str(out), "-vf",
+                          "crop=200:200:440:860,signalstats,metadata=mode=print:key=lavfi.signalstats.YAVG:file=-",
+                          "-an", "-f", "null", "-"], capture_output=True, text=True).stdout
+    times = [float(t) for t in re.findall(r"pts_time:([\d.]+)", lum)]
+    yavg = [float(v) for v in re.findall(r"YAVG=([\d.]+)", lum)]
+    flash = next(t for t, y in zip(times, yavg) if y > 200)
+    samples = decode_audio(str(out))
+    win = SR // 100  # 10 ms windows
+    rms = [float(np.sqrt(np.mean(samples[i:i + win] ** 2))) for i in range(0, len(samples) - win, win)]
+    beep = next(i for i, r in enumerate(rms) if r > 0.05) / 100
+    assert flash == pytest.approx(0.7, abs=0.1) and beep == pytest.approx(0.7, abs=0.1)
+    assert abs(flash - beep) < 0.07  # within about two frames
 
 
 def test_render_split_layout(synthetic_mp4, tmp_path):

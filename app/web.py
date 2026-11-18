@@ -13,6 +13,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
 from .pipeline import ClipError, Pipeline
+from .rating import clip_rating, rating_label
 
 STATIC = Path(__file__).parent / "static"
 security = HTTPBasic(auto_error=False)
@@ -148,5 +149,7 @@ def create_app(pl: Pipeline, start_pipeline: bool = True) -> FastAPI:
 
 
 def _public(c: dict) -> dict:
+    r = clip_rating(c.get("score"), c.get("audio_z"), c.get("chat_z"))
     return {k: v for k, v in c.items() if k not in ("path", "thumb")} | {
-        "has_video": bool(c.get("path")), "has_thumb": bool(c.get("thumb"))}
+        "has_video": bool(c.get("path")), "has_thumb": bool(c.get("thumb")),
+        "rating": r, "rating_label": rating_label(r)}

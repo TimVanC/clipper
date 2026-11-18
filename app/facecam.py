@@ -34,7 +34,8 @@ MAX_FACE_H = 0.28                   # a bigger face means a full-screen camera, 
 FACE_TO_CAM_W = 3.4                 # cam crop width, in face widths (head and shoulders)
 MIN_SCORE = 0.75
 MIN_MOTION = 3.0                    # pixel change around the face; pictures and menus measure ~1
-MIN_SIDES = 2                       # straight cam-box edges found around the face
+MIN_SIDES = 2                       # straight cam-box edges found around the face...
+EDGE_ZONE = 0.25                    # ...or a live face this close to a side of the frame (borderless cams)
 
 
 # ---- pure geometry (unit tested) ------------------------------------------------------------
@@ -212,8 +213,8 @@ def detect_faces(frames: list[np.ndarray], min_score: float = MIN_SCORE) -> list
 
 def find_facecam(pieces: list[Piece], fw: int, fh: int, ffmpeg: str = "ffmpeg") -> Box | None:
     """-> cam crop box (fractions of the frame), or None. A face counts as a facecam only if it stays in one
-    place, keeps moving (not a poster or logo) and sits in a box with at least MIN_SIDES straight edges.
-    Borderless (green-screen) cams therefore fall back to the blur layout unless pinned in facecam_boxes."""
+    place, keeps moving (not a poster or logo) and either sits in a box with at least MIN_SIDES straight
+    edges or near a side of the frame (small or borderless cams; then the crop is sized from the face)."""
     frames = sample_frames(pieces, ffmpeg)
     if not frames:
         return None
@@ -221,9 +222,15 @@ def find_facecam(pieces: list[Piece], fw: int, fh: int, ffmpeg: str = "ffmpeg") 
         motion = face_motion(frames, face)
         box, sides = cam_border(frames, face, cam_crop(face, fw, fh))
         log.info("face at %.2f,%.2f: motion %.1f, %d cam edges", face[0], face[1], motion, sides)
-        if motion >= MIN_MOTION and sides >= MIN_SIDES:
+        if motion >= MIN_MOTION and (sides >= MIN_SIDES or near_edge(face)):
             return box
     return None
+
+
+def near_edge(face: Box) -> bool:
+    """Facecams sit along the sides, top or bottom of the frame; key art and posters sit in the middle."""
+    cx, cy = face[0] + face[2] / 2, face[1] + face[3] / 2
+    return cx < EDGE_ZONE or cx > 1 - EDGE_ZONE or cy < EDGE_ZONE or cy > 1 - EDGE_ZONE
 
 
 def choose_layout(pieces: list[Piece], layout: str, game: str, handle: str, boxes: str = "",

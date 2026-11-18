@@ -49,6 +49,18 @@ def parse_categories(value: str) -> list[tuple[str | None, str]]:
     return out
 
 
+def parse_start(value: str) -> float | None:
+    """'2026-11-18 06:00' (this computer's time zone) or ISO with an offset -> epoch seconds; '' -> None."""
+    from datetime import datetime
+    if not str(value or "").strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).strip().replace("T", " ").replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"category_start: expected a date and time like 2026-11-18 06:00, got {value!r}")
+    return (dt if dt.tzinfo else dt.astimezone()).timestamp()
+
+
 def split_list(value: str) -> list[str]:
     return [p.strip().lstrip("@").lower() for p in str(value).replace("\n", ",").split(",") if p.strip()]
 
@@ -94,6 +106,7 @@ TUNABLES: dict[str, tuple[type, float | None, float | None]] = {
     "category_min_viewers": (int, 0, 10_000_000),
     "category_languages": (str, None, None),
     "category_exclude": (str, None, None),
+    "category_start": (str, None, None),
     "auto_approve": (bool, None, None),
     "delete_raw": (bool, None, None),
     "default_accounts": (str, None, None),
@@ -156,6 +169,7 @@ class Settings:
     category_min_viewers: int = 1000
     category_languages: str = "en"  # comma separated; empty = any language
     category_exclude: str = ""      # handles never to pick from a category
+    category_start: str = ""        # don't auto-watch before this time ("2026-11-18 06:00"), e.g. a game's launch
     auto_approve: bool = False
     delete_raw: bool = True
     default_accounts: str = ""
@@ -222,6 +236,8 @@ class Settings:
                 parse_boxes(val)
             if k == "watch_categories":
                 parse_categories(val)
+            if k == "category_start":
+                parse_start(val)
             if k == "caption_template":
                 captions.validate(val.replace("\\n", "\n"))
             if k == "caption_hooks":

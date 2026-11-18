@@ -134,6 +134,16 @@ class Database:
                         (since_ts,))
         return int(row["n"]) if row else 0
 
+    def fail_interrupted_posts(self) -> list[int]:
+        """Clips left in 'posting' by a stopped app. They may have reached some networks, so they become
+        'failed' with a note rather than being retried (a retry could post twice)."""
+        ids = [r["id"] for r in self._all("SELECT id FROM clips WHERE status='posting'")]
+        if ids:
+            self._exec(f"UPDATE clips SET status='failed', post_error=? WHERE id IN ({','.join('?' * len(ids))})",
+                       ("the app was stopped while posting: check your profiles before retrying, "
+                        "it may already be up on some of them", *ids))
+        return ids
+
     def counts(self) -> dict[str, int]:
         out = {s: 0 for s in CLIP_STATUSES}
         for r in self._all("SELECT status, COUNT(*) AS n FROM clips GROUP BY status"):

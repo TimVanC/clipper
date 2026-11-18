@@ -6,9 +6,11 @@ tests swap in a fake source that emits a synthetic stream on stdout.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 from pathlib import Path
@@ -19,6 +21,27 @@ WINDOWS = os.name == "nt"
 # The pipeline (bash + source + ffmpeg) gets its own process group so stop() can signal all of it at once.
 _GROUP_KW: dict = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if WINDOWS
                    else {"start_new_session": True})
+
+
+@functools.lru_cache(maxsize=1)
+def find_bash() -> str:
+    """bash runs the source | ffmpeg pipeline. On Windows it is usually not on PATH in a plain terminal, but
+    Git for Windows ships one; WSL's System32\\bash.exe is skipped (it runs Linux, without these tools)."""
+    found = shutil.which("bash")
+    if found and not (WINDOWS and found.lower().endswith(r"system32\bash.exe")):
+        return found
+    if WINDOWS:
+        roots = []
+        git = shutil.which("git")
+        if git:
+            roots.append(Path(git).resolve().parents[1])  # ...\Git\cmd\git.exe -> ...\Git
+        roots += [Path(os.environ.get(v, "")) / "Git" for v in ("ProgramFiles", "ProgramW6432", "LOCALAPPDATA")]
+        roots.append(Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Git")
+        for root in roots:
+            for cand in (root / "bin" / "bash.exe", root / "usr" / "bin" / "bash.exe"):
+                if cand.is_file():
+                    return str(cand)
+    raise RuntimeError("bash not found: install Git for Windows (git-scm.com) or put bash on PATH")
 
 
 def _interrupt(proc: asyncio.subprocess.Process) -> bool:
@@ -87,7 +110,7 @@ class Recorder:
         try:
             while not self._stopping:
                 self._proc = await asyncio.create_subprocess_exec(
-                    "bash", "-o", "pipefail", "-c", self._command(),
+                    find_bash(), "-o", "pipefail", "-c", self._command(),
                     stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
                     **_GROUP_KW)
                 _, err = await self._proc.communicate()

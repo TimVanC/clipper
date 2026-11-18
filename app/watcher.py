@@ -11,14 +11,16 @@ from .platforms.base import LiveInfo, PlatformClient
 
 log = logging.getLogger("clipper.watcher")
 Key = tuple[str, str]
+BUMP_RATIO = 2.0  # a waiting stream with this many times the viewers of the smallest pick takes its slot
 
 
 @dataclass
 class CategoryWatch:
     """Record the most-watched streams in a category, whoever is streaming it.
 
-    Up to `streams` are recorded at once, across all platforms. A stream keeps its slot until it ends or moves
-    to another category; falling a few places in the ranking does not stop it."""
+    Up to `streams` are recorded at once, across all platforms. A stream keeps its slot until it ends, moves
+    to another category, or a stream with BUMP_RATIO times its viewers is waiting; falling a few places in
+    the ranking does not stop it."""
     categories: list[tuple[str | None, str]] = field(default_factory=list)  # (platform or None = all, name)
     streams: int = 3
     min_viewers: int = 1000
@@ -72,13 +74,24 @@ class Watcher:
                 except Exception as e:
                     log.warning("%s category %r failed: %s", plat, name, e)
                     self.last_error[err_key] = str(e)[:200]
-        for info, name in sorted(found, key=lambda f: -f[0].viewers):
-            if len(self.auto) >= cw.streams or info.viewers < cw.min_viewers:
-                break
-            key = (info.platform, info.handle.lower())
-            if key not in explicit and key not in self.auto and key[1] not in cw.exclude:
-                log.info("auto-watching %s/%s (%d viewers in %s)", *key, info.viewers, name)
-                self.auto[key] = name
+        waiting = [(info, name) for info, name in sorted(found, key=lambda f: -f[0].viewers)
+                   if info.viewers >= cw.min_viewers and (info.platform, info.handle.lower()) not in explicit
+                   and (info.platform, info.handle.lower()) not in self.auto and info.handle.lower() not in cw.exclude]
+        while waiting and len(self.auto) < cw.streams:
+            info, name = waiting.pop(0)
+            log.info("auto-watching %s/%s (%d viewers in %s)", info.platform, info.handle, info.viewers, name)
+            self.auto[(info.platform, info.handle.lower())] = name
+        if waiting and self.auto:
+            # a much bigger stream takes the smallest pick's slot (one swap per poll, so it doesn't churn)
+            viewers = {(i.platform, i.handle.lower()): i.viewers for i, _ in found}
+            now = {k: viewers.get(k, self.live[k].viewers if k in self.live else 0) for k in self.auto}
+            weakest = min(now, key=lambda k: now[k])
+            info, name = waiting[0]
+            if info.viewers >= BUMP_RATIO * max(now[weakest], 1):
+                log.info("auto-watching %s/%s (%d viewers) instead of %s/%s (%d)", info.platform, info.handle,
+                         info.viewers, *weakest, now[weakest])
+                self.auto.pop(weakest)
+                self.auto[(info.platform, info.handle.lower())] = name
 
     async def poll_once(self) -> None:
         import time

@@ -40,6 +40,7 @@
   a.btn { background:var(--acc); color:#fff; border-radius:8px; padding:10px 14px; font-weight:600;
           text-decoration:none; display:inline-block; text-align:center; }
   a.btn.ghost { background:#222633; color:var(--txt); }
+  .tag.rate { color:#c9a227; } .tag.rate.great { color:#ffcc33; font-weight:600; } .tag.rate.weak { color:var(--mut); }
   .tag.posted, .tag.approved { color:var(--ok); } .tag.failed { color:var(--bad); } .tag.posting { color:var(--warn); }
   .err { color:var(--bad); font-size:13px; margin-top:6px; }
   .accts label { display:flex; align-items:center; gap:8px; color:var(--txt); font-size:14px; margin:4px 0; }
@@ -66,6 +67,11 @@
 <script>
 const $ = (s, el=document) => el.querySelector(s);
 let state = null, accounts = null, tab = 'review', clips = [], highlight = null, editing = false;
+const picked = {}, drafts = {};  // account ticks and caption edits per clip, kept across refreshes
+let lastHTML = '';
+const playing = () => [...document.querySelectorAll('video')].some(v => !v.paused && !v.ended);
+const stars = r => '★'.repeat(Math.round(r/2)) + '☆'.repeat(5 - Math.round(r/2));
+function pick(id) { picked[id] = [...document.querySelectorAll('.acct-'+id+':checked')].map(x=>x.value); }
 
 async function api(path, opts={}) {
   const r = await fetch(path, {headers:{'Content-Type':'application/json'}, ...opts,
@@ -77,7 +83,7 @@ function toast(msg) { const t=$('#toast'); t.textContent=msg; t.style.display='b
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const ago = ts => { if(!ts) return 'never'; const s=Math.max(0,Date.now()/1000-ts); return s<90?`${s|0}s ago`:s<5400?`${(s/60)|0}m ago`:`${(s/3600)|0}h ago`; };
 
-async function refresh() {
+async function refresh(force) {
   try {
     state = await api('/api/state');
     clips = await api(tab==='history' ? '/api/clips' : '/api/clips?status=pending');
@@ -88,15 +94,17 @@ async function refresh() {
     $('#pill-cfg').className = 'pill ' + (missing.length ? 'off' : 'on');
     const n = state.counts.pending||0, b = $('#b-review'); b.hidden = !n; b.textContent = n;
   } catch (e) { $('#pill-cfg').textContent = 'offline: ' + e.message; $('#pill-cfg').className='pill off'; return; }
-  try { if (!editing) render(); } catch (e) { console.error(e); toast('Display error: ' + e.message); }
+  try { if (!editing) render(force); } catch (e) { console.error(e); toast('Display error: ' + e.message); }
 }
 
-function render() {
+function render(force) {
   const m = $('#main');
-  if (tab === 'review') m.innerHTML = reviewHTML();
-  else if (tab === 'live') m.innerHTML = liveHTML();
-  else if (tab === 'history') m.innerHTML = historyHTML();
-  else m.innerHTML = settingsHTML();
+  const html = tab === 'review' ? reviewHTML() : tab === 'live' ? liveHTML()
+             : tab === 'history' ? historyHTML() : settingsHTML();
+  // redraw only when something changed, and never under a playing video (that restarts it)
+  if (!force && (html === lastHTML || playing())) return;
+  lastHTML = html;
+  m.innerHTML = html;
   if (tab === 'review' && highlight) { const el = $('#clip-'+highlight); if (el) { el.classList.add('hl'); el.scrollIntoView?.({block:'center'}); highlight=null; } }
 }
 
@@ -104,15 +112,20 @@ function reviewHTML() {
   if (!clips.length) return `<div class="card mut">No clips waiting. When a tracked streamer goes live and something hype happens, it shows up here (and in Discord).</div>`;
   const defaults = (state.settings.default_accounts||'').split(',').filter(Boolean);
   const manual = isManual();
-  return clips.map(c => `
+  const best = [...clips].sort((a, b) => b.rating - a.rating || b.id - a.id);  // best clips first
+  return best.map(c => `
     <div class="card clip" id="clip-${c.id}">
-      <div class="row"><b class="grow">${esc(c.handle)} <span class="mut">· ${esc(c.platform)}</span></b>
-        <span class="tag">${(c.end_s-c.start_s)|0}s</span><span class="tag">score ${c.score.toFixed(1)}</span></div>
+      <div class="row"><b class="grow">${esc(c.handle)} <span class="mut">· ${esc(c.platform)} · #${c.id}</span></b>
+        <span class="tag rate ${esc(c.rating_label)}" title="How hard audio and chat reacted, vs the rest of the stream">
+          ${stars(c.rating)} ${c.rating.toFixed(1)} ${esc(c.rating_label)}</span>
+        <span class="tag">${(c.end_s-c.start_s)|0}s</span></div>
       <video controls playsinline preload="metadata" src="/api/clips/${c.id}/video" poster="/api/clips/${c.id}/thumb"></video>
-      <label>Caption</label><textarea id="cap-${c.id}" onfocus="editing=true" onblur="editing=false">${esc(c.caption)}</textarea>
+      <label>Caption</label><textarea id="cap-${c.id}" onfocus="editing=true" onblur="editing=false"
+        oninput="drafts[${c.id}]=this.value">${esc(drafts[c.id] ?? c.caption)}</textarea>
       ${manual ? '<div class="mut" style="margin-top:8px">Manual mode: Approve marks the clip, then download it and post it yourself.</div>' : `<label>Post to</label>
       <div class="accts">${(accounts||[]).map(a=>`<label><input type="checkbox" class="acct-${c.id}" value="${esc(a.id)}"
-          ${(c.accounts? c.accounts.split(','): defaults).includes(a.id)?'checked':''}> ${esc(a.platform)} · ${esc(a.username)}</label>`).join('')
+          onchange="pick(${c.id})"
+          ${(picked[c.id] ?? (c.accounts? c.accounts.split(','): defaults)).includes(a.id)?'checked':''}> ${esc(a.platform)} · ${esc(a.username)}</label>`).join('')
           || `<span class="mut">No accounts loaded. Connect accounts in ${esc(posterLabel())} and set the API key.</span>`}</div>`}
       ${c.post_error?`<div class="err">${esc(c.post_error)}</div>`:''}
       <div class="row" style="margin-top:10px">
@@ -137,9 +150,12 @@ function liveHTML() {
       <button class="btn bad" onclick="delStreamer(${s.id})">✕</button></div>`).join('');
   const errs = Object.entries(state.watcher.errors||{}).map(([k,v])=>`<div class="err">${esc(k)}: ${esc(v)}</div>`).join('');
   const st = state.settings, cats = (st.watch_categories||'').trim();
+  const startTs = state.category_start_ts, waiting = startTs && startTs * 1000 > Date.now();
   const auto = cats && st.category_streams > 0
-    ? `<div class="card mut">Auto-watching the top ${st.category_streams} stream(s) in <b>${esc(cats)}</b>
-        (${st.category_min_viewers}+ viewers${st.category_languages?', '+esc(st.category_languages):''}). Change it in Settings.</div>`
+    ? `<div class="card mut">${waiting ? 'Will auto-watch' : 'Auto-watching'} the top ${st.category_streams} stream(s) in <b>${esc(cats)}</b>
+        (${st.category_min_viewers}+ viewers${st.category_languages?', '+esc(st.category_languages):''})${waiting
+        ? ` starting <b>${esc(new Date(startTs*1000).toLocaleString([], {weekday:'short', hour:'numeric', minute:'2-digit'}))}</b>` : ''}.
+        Change it in Settings.</div>`
     : `<div class="card mut">Category auto-watch is off. Set it in Settings, e.g. Grand Theft Auto VI.</div>`;
   return `<h2>Live now</h2>${auto}${live || '<div class="card mut">Nobody live right now.</div>'}
     <h2>Tracked streamers</h2>${sts || '<div class="card mut">Add a streamer below.</div>'}
@@ -155,7 +171,7 @@ function historyHTML() {
   if (!clips.length) return `<div class="card mut">No clips yet.</div>`;
   return clips.map(c => `<div class="card"><div class="row"><b class="grow">${esc(c.handle)}</b>
       <span class="tag ${c.status}">${c.status}</span></div>
-      <div class="mut">#${c.id} · ${(c.end_s-c.start_s)|0}s · score ${c.score.toFixed(1)} · ${ago(c.created_at)}</div>
+      <div class="mut">#${c.id} · ${(c.end_s-c.start_s)|0}s · ${stars(c.rating)} ${c.rating.toFixed(1)} ${esc(c.rating_label)} · ${ago(c.created_at)}</div>
       ${c.post_error?`<div class="err">${esc(c.post_error)}</div>`:''}
       ${c.status==='failed'&&c.has_video?`<button class="btn" style="margin-top:8px" onclick="approve(${c.id})">Retry post</button>`:''}
       ${c.has_video&&(c.status==='approved'||(isManual()&&c.status!=='rejected'))?`<div style="margin-top:8px">${downloadBtn(c)}</div>`:''}</div>`).join('');
@@ -176,6 +192,7 @@ const FIELDS = [
   ['category_min_viewers','Category: min viewers','number'],
   ['category_languages','Category: languages (comma separated, empty = any)','text'],
   ['category_exclude','Category: never pick these handles','text'],
+  ['category_start','Category: start at (e.g. 2026-11-18 06:00, this computer\'s time; empty = now)','text'],
   ['layout','Layout: auto (facecam on top for games, else blur), split, blur or crop','text'],
   ['facecam_boxes','Pin a facecam: handle=x,y,w,h as fractions of the frame (only when auto gets it wrong)','text'],
   ['z_threshold','Hype threshold (lower = more clips)','number'],
@@ -206,11 +223,14 @@ function settingsHTML() {
 
 async function approve(id) {
   const caption = $('#cap-'+id)?.value;
-  const accts = [...document.querySelectorAll('.acct-'+id+':checked')].map(x=>x.value);
-  try { await api(`/api/clips/${id}/approve`, {method:'POST', body:{caption, accounts: accts.length?accts:null}});
-        toast(isManual() ? 'Approved. Download it from History' : 'Approved: posting…'); } catch(e) { toast(e.message); } refresh();
+  const boxes = document.querySelectorAll('.acct-'+id);
+  // the ticked accounts, even none (the server then refuses); null only where no boxes are shown (History retry)
+  const accts = boxes.length ? [...boxes].filter(x=>x.checked).map(x=>x.value) : null;
+  try { await api(`/api/clips/${id}/approve`, {method:'POST', body:{caption, accounts: accts}});
+        delete picked[id]; delete drafts[id];
+        toast(isManual() ? 'Approved. Download it from History' : 'Approved: posting…'); } catch(e) { toast(e.message); } refresh(true);
 }
-async function reject(id) { try { await api(`/api/clips/${id}/reject`, {method:'POST'}); } catch(e){ toast(e.message);} refresh(); }
+async function reject(id) { try { await api(`/api/clips/${id}/reject`, {method:'POST'}); } catch(e){ toast(e.message);} refresh(true); }
 async function addStreamer() {
   try { await api('/api/streamers', {method:'POST', body:{platform:$('#n-plat').value, handle:$('#n-handle').value}}); editing=false; toast('Added'); }
   catch(e){ toast(e.message); } refresh();
@@ -226,11 +246,11 @@ async function testDiscord() { try { const r = await api('/api/test/discord', {m
 
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active')); b.classList.add('active');
-  tab = b.dataset.tab; editing=false; refresh();
+  tab = b.dataset.tab; editing=false; refresh(true);
 });
 function hashNav() { const m = location.hash.match(/^#clip-(\d+)/); if (m) { highlight = m[1]; tab='review'; } }
-hashNav(); window.onhashchange = () => { hashNav(); refresh(); };
-api('/api/accounts').then(a => { accounts = a; render(); }).catch(()=>{ accounts = []; });
+hashNav(); window.onhashchange = () => { hashNav(); refresh(true); };
+api('/api/accounts').then(a => { accounts = a; if (state) render(true); }).catch(()=>{ accounts = []; });
 refresh(); setInterval(refresh, 5000);
 </script>
 </body>

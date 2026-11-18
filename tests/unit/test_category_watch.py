@@ -2,7 +2,8 @@ import httpx
 import pytest
 import respx
 
-from app.config import Settings, parse_categories
+from app.config import Settings, parse_categories, parse_start
+from app.pipeline import category_watch_from
 from app.platforms.base import LiveInfo
 from app.platforms.kick import KickClient
 from app.platforms.twitch import TwitchClient
@@ -28,6 +29,22 @@ def test_parse_categories_and_settings():
         with pytest.raises(ValueError):
             s.update(bad)
     assert Settings().layout == "auto"
+
+
+def test_category_watch_waits_for_its_start_time():
+    launch = parse_start("2026-11-18T06:00-05:00")
+    assert launch == parse_start("2026-11-18 11:00Z") == 1794999600.0 and parse_start("") is None
+    with pytest.raises(ValueError):
+        Settings().update({"category_start": "tomorrow-ish"})
+    s = Settings()
+    s.update({"watch_categories": GTA, "category_start": "2026-11-18T06:00-05:00", "category_exclude": "Twitch"})
+    assert category_watch_from(s, launch - 1) is None                  # countdown still running
+    cw = category_watch_from(s, launch)
+    assert cw.categories == [(None, GTA)] and cw.exclude == {"twitch"} and cw.streams == 3
+    s.update({"category_start": ""})
+    assert category_watch_from(s, 0) is not None                       # no start time: right away
+    s.update({"watch_categories": ""})
+    assert category_watch_from(s, launch) is None                      # feature off
 
 
 @respx.mock
@@ -124,10 +141,9 @@ async def test_watcher_records_the_top_streams_of_a_category():
     assert w.auto == {("twitch", "a"): GTA, ("kick", "k1"): GTA, ("twitch", "c"): GTA}
     assert {e[2] for e in events} == {"a", "b", "c", "k1"} and all(e[0] == "live" for e in events)
 
-    # a bigger stream appears, but nobody lost their slot: a falling in the ranking is not a reason to stop
+    # a bigger stream appears, but not twice the smallest pick (c, 2000): nobody loses their slot
     events.clear()
-    tw.streams["new"] = (90000, GTA)
-    tw.streams["a"] = (150, GTA)
+    tw.streams["new"] = (3500, GTA)
     await w.poll_once()
     assert events == [] and ("twitch", "new") not in w.auto
 
@@ -139,11 +155,27 @@ async def test_watcher_records_the_top_streams_of_a_category():
     await w.poll_once()
     assert ("live", "twitch", "new") in events and w.auto[("twitch", "new")] == GTA
 
+    # a huge stream shows up (launch day): it takes the smallest pick's slot (k1, 3000), one swap per poll
+    tw.streams["mega"] = (90000, GTA)
+    tw.streams["mega2"] = (80000, GTA)
+    events.clear()
+    await w.poll_once()
+    assert ("off", "kick", "k1") in events and ("live", "twitch", "mega") in events
+    assert ("twitch", "mega2") not in w.auto and len(w.auto) == 3
+    events.clear()
+    await w.poll_once()  # next poll: mega2 bumps the next smallest (new, 3500)
+    assert ("off", "twitch", "new") in events and ("live", "twitch", "mega2") in events
+    assert set(w.auto) == {("twitch", "a"), ("twitch", "mega"), ("twitch", "mega2")}
+    del tw.streams["mega2"]
+    tw.streams["new"] = (0, "Just Chatting")
+
     # a ends: slot freed
     del tw.streams["a"]
     events.clear()
     await w.poll_once()
     assert ("off", "twitch", "a") in events and ("twitch", "a") not in w.auto
+    tw.streams["new"] = (3500, GTA)
+    await w.poll_once()
 
     # excluded handles are dropped and never picked; turning the feature off stops every auto stream
     cw.exclude = {"new"}
@@ -154,7 +186,7 @@ async def test_watcher_records_the_top_streams_of_a_category():
     w.category_watch = lambda: cw_off
     events.clear()
     await w.poll_once()
-    assert w.auto == {} and {e for e in events if e[0] == "off"} >= {("off", "kick", "k1")}
+    assert w.auto == {} and ("off", "twitch", "mega") in events
     assert ("twitch", "b") in w.live  # the hand-picked streamer is untouched
 
 

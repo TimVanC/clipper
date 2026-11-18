@@ -78,6 +78,14 @@ def test_face_motion_tells_a_webcam_from_a_picture():
     assert face_motion([np.full((540, 960, 3), 80, np.uint8)] * 6, face) == 0.0
 
 
+def test_borderless_cams_count_only_near_the_edge_of_the_frame():
+    from app.facecam import near_edge
+    assert near_edge((0.11, 0.75, 0.05, 0.1))       # ohnepixel: small cam, bottom-left
+    assert near_edge((0.11, 0.10, 0.05, 0.1))       # n3on: top-left
+    assert near_edge((0.85, 0.45, 0.05, 0.1))       # right side
+    assert not near_edge((0.49, 0.30, 0.03, 0.08))  # the GTA VI key art in the middle of a countdown stream
+
+
 def test_parse_boxes():
     assert parse_boxes("CaseOh_=0.7,0,0.3,0.3; @n3on=0,0.6,0.25,0.4\n") == {
         "caseoh_": (0.7, 0.0, 0.3, 0.3), "n3on": (0.0, 0.6, 0.25, 0.4)}
