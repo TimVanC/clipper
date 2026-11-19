@@ -112,6 +112,7 @@ TUNABLES: dict[str, tuple[type, float | None, float | None]] = {
     "auto_approve": (bool, None, None),
     "auto_post_min_rating": (float, 0, 10),
     "auto_post_version": (str, None, None),
+    "tiktok_version": (str, None, None),
     "full_frame_version": (bool, None, None),
     "delete_raw": (bool, None, None),
     "default_accounts": (str, None, None),
@@ -165,7 +166,8 @@ class Settings:
     audio_weight: float = 1.0
     chat_weight: float = 1.5
     chat_delay_s: float = 8.0
-    max_posts_per_day: int = 20
+    # uploads per social account per rolling 24h; each network's own cap (TikTok 15, YouTube 30...) still applies
+    max_posts_per_day: int = 30
     # auto: facecam on top + game below while a game is played and a cam is found, blur otherwise
     layout: str = "auto"
     facecam_boxes: str = ""         # "handle=x,y,w,h; ..." pins a streamer's cam (fractions of the frame)
@@ -183,6 +185,8 @@ class Settings:
     auto_approve: bool = False
     auto_post_min_rating: float = 0.0  # > 0: post clips rated at least this (0-10) without review
     auto_post_version: str = "headline"  # which version auto-posting uses: headline | plain | full | all
+    # when posting all versions: the one TikTok gets (its 15 posts a day go further), or all
+    tiktok_version: str = "headline"
     full_frame_version: bool = True      # also render the full-frame version of each clip (one more render)
     delete_raw: bool = True
     default_accounts: str = ""
@@ -253,8 +257,8 @@ class Settings:
                 parse_categories(val)
             if k == "category_start":
                 parse_start(val)
-            if k == "auto_post_version" and val not in ("headline", "plain", "full", "all"):
-                raise ValueError("auto_post_version must be headline, plain, full or all")
+            if k in ("auto_post_version", "tiktok_version") and val not in ("headline", "plain", "full", "all"):
+                raise ValueError(f"{k} must be headline, plain, full or all")
             if k == "headline_mode" and val not in HEADLINE_MODES:
                 raise ValueError(f"headline_mode must be one of {', '.join(HEADLINE_MODES)}")
             if k == "caption_template":

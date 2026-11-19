@@ -206,6 +206,7 @@ const FIELDS = [
   ['default_accounts','Default account ids for the posting provider (comma separated)','text'],
   ['auto_post_min_rating','Auto-post clips rated at least (0-10, 0 = never; the daily cap still applies)','number'],
   ['auto_post_version','Version auto-posting uses: headline, plain (no text), full (full frame) or all (each as its own post)','text'],
+  ['tiktok_version','Posting all versions: the one TikTok gets (headline, plain, full) or all; other networks get every version','text'],
   ['headline_mode','On-screen headline: auto (Claude when ANTHROPIC_API_KEY is set, else none), claude, local (free, rough) or off','text'],
   ['caption_template','Caption template: {hook} {hashtags} {name} {game} {title} {streamer} {platform}','area'],
   ['caption_hooks','Opening lines, one per line, rotated per clip ({name}, {game}). Empty = built-in set','area'],
@@ -228,7 +229,7 @@ const FIELDS = [
   ['max_clips_per_hour','Max clips per hour','number'],
   ['audio_weight','Audio weight','number'], ['chat_weight','Chat weight','number'],
   ['poll_seconds','Live-check interval (s)','number'], ['chunk_seconds','Recording chunk length (s)','number'],
-  ['max_posts_per_day','Max uploads per day (each version posted counts; Upload-Post allows 15 TikTok posts a day)','number'],
+  ['max_posts_per_day','Max uploads per account per day (each version counts; Upload-Post also caps TikTok at 15, YouTube at 30)','number'],
 ];
 function settingsHTML() {
   const s = state.settings, p = state.poster || {};

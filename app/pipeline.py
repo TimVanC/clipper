@@ -11,7 +11,7 @@ from typing import Callable
 
 from .captions import build_caption
 from .chat import ChatLog, TwitchChatListener
-from .clipper import CLASSIC_TOP, ChunkIndex, make_preview, make_thumb, render_clip
+from .clipper import ChunkIndex, make_preview, make_thumb, render_clip
 from .config import Settings, parse_categories, parse_start, split_list
 from . import headline
 from .facecam import choose_layout
@@ -48,6 +48,15 @@ def category_watch_from(s: Settings, now: float) -> CategoryWatch | None:
 
 
 VERSIONS = ("headline", "plain", "full")
+
+# posts per connected account per rolling 24h that Upload-Post lets through (docs.upload-post.com/guides/limit-of-uploads)
+NETWORK_CAPS = {"tiktok": 15, "youtube": 30, "instagram": 50, "facebook": 25, "threads": 50, "linkedin": 150,
+                "pinterest": 20, "x": 10, "bluesky": 25}
+
+
+def network_of(account: str) -> str:
+    """'default:tiktok' / 'uploadpost/default:youtube' -> 'tiktok' / 'youtube' (the id itself if no network)."""
+    return account.rsplit(":", 1)[-1].rsplit("/", 1)[-1].lower()
 
 
 def _as_hook(text: str) -> str:
@@ -184,7 +193,7 @@ class SessionWorker:
                     log.exception("headline overlay failed for clip %s; posting it without", clip_id)
                     text = ""
                     await asyncio.to_thread(headline.apply, base, out, "", seam, pl.s.ffmpeg_cmd)
-                await pl.make_full_version(clip_id, pieces, text)
+                await pl.make_full_version(clip_id, pieces)
                 try:
                     await asyncio.to_thread(make_thumb, out, thumb, pl.s.ffmpeg_cmd, min(3.0, (cand.end_s - cand.start_s) / 2))
                 except Exception:
@@ -247,31 +256,37 @@ class Pipeline:
         return self.clips_dir / f"{clip_id}_base.mp4"
 
     def full_path(self, clip_id: int, base: bool = False) -> Path:
-        """The full-frame version (whole stream frame on black, headline as white text above it)."""
+        """The full-frame version: the whole stream frame on black, no text. (base=True: the text-free
+        render older clips kept next to a titled <id>_full.mp4.)"""
         return self.clips_dir / f"{clip_id}_full{'_base' if base else ''}.mp4"
 
+    def full_file(self, clip_id: int) -> Path | None:
+        """The full-frame file to show and post: always the text-free one."""
+        for p in (self.full_path(clip_id, base=True), self.full_path(clip_id)):
+            if p.exists():
+                return p
+        return None
+
     def version_file(self, clip: dict, version: str) -> Path:
-        """headline: the main clip | plain: same layout, no text | full: the full-frame version."""
+        """headline: the main clip | plain: same layout, no text | full: the full frame, no text."""
         cid = clip["id"]
         if version == "plain" and self.base_path(cid).exists():
             return self.base_path(cid)
-        if version == "full" and self.full_path(cid).exists():
-            return self.full_path(cid)
+        if version == "full" and self.full_file(cid):
+            return self.full_file(cid)  # type: ignore[return-value]
         if version not in VERSIONS:
             raise ClipError(f"version must be one of {', '.join(VERSIONS)}")
         return Path(clip["path"])
 
-    async def make_full_version(self, clip_id: int, pieces, text: str) -> None:
-        """Render the full-frame version from the source pieces (only possible while they still exist)."""
+    async def make_full_version(self, clip_id: int, pieces) -> None:
+        """Render the full-frame version (no text) from the source pieces, while they still exist."""
         if not self.s.full_frame_version:
             return
-        fbase, full = self.full_path(clip_id, base=True), self.full_path(clip_id)
+        full = self.full_path(clip_id)
         try:
-            await asyncio.to_thread(render_clip, pieces, fbase, "classic", self.s.ffmpeg_cmd)
-            await asyncio.to_thread(headline.apply, fbase, full, text, CLASSIC_TOP, self.s.ffmpeg_cmd, "plain")
+            await asyncio.to_thread(render_clip, pieces, full, "classic", self.s.ffmpeg_cmd)
         except Exception:
             log.exception("full-frame version failed for clip %s", clip_id)
-            fbase.unlink(missing_ok=True)
             full.unlink(missing_ok=True)
 
     def headline_writer(self) -> str:
@@ -313,9 +328,6 @@ class Pipeline:
         if not base.exists():
             raise ClipError("this clip was made before headlines existed, so its text can't be changed")
         await asyncio.to_thread(headline.apply, base, clip["path"], text, clip.get("seam") or 768, self.s.ffmpeg_cmd)
-        if self.full_path(clip_id, base=True).exists():
-            await asyncio.to_thread(headline.apply, self.full_path(clip_id, base=True), self.full_path(clip_id), text,
-                                    CLASSIC_TOP, self.s.ffmpeg_cmd, "plain")
         if clip.get("thumb"):
             try:
                 await asyncio.to_thread(make_thumb, clip["path"], clip["thumb"], self.s.ffmpeg_cmd, 3.0)
@@ -323,6 +335,58 @@ class Pipeline:
                 pass
         self.db.update_clip(clip_id, headline=text)
         return self.db.get_clip(clip_id)  # type: ignore[return-value]
+
+    def same_setup(self, accounts: str) -> bool:
+        """Was a clip posted through the current posting provider(s)? The daily cap mirrors the provider's own
+        limit (Upload-Post: 15 TikTok posts a day), so posts made through a provider no longer used don't count.
+        One provider: account ids have no 'provider/' prefix; several: every prefix is a current provider."""
+        names = self.s.poster_names()
+        ids = [a for a in (accounts or "").split(",") if a]
+        if len(names) == 1:
+            return all("/" not in a for a in ids)
+        return all(a.partition("/")[0] in names for a in ids)
+
+    def cap_for(self, account: str) -> int:
+        return min(NETWORK_CAPS.get(network_of(account), self.s.max_posts_per_day), self.s.max_posts_per_day)
+
+    def uploads_today(self) -> dict[str, int]:
+        """Uploads per account in the last 24h through the current setup. post_id holds one entry per upload:
+        'id' or 'version=id', with '@acct+acct' when it went to only some of the clip's accounts."""
+        used: dict[str, int] = {}
+        for r in self.db.posts_since(time.time() - 86400):
+            if not self.same_setup(r["accounts"]):
+                continue
+            accts = [a for a in (r["accounts"] or "").split(",") if a] or ["*"]  # no accounts yet: counts for all
+            for entry in (r["post_id"] or "").split(",") if r["post_id"] else [""]:
+                targets = entry.rsplit("@", 1)[1].split("+") if "@" in entry else accts
+                for a in targets:
+                    used[a] = used.get(a, 0) + 1
+        return used
+
+    def post_plan(self, clip: dict, version: str, accounts: list[str]) -> tuple[list[tuple[str, Path, list[str]]],
+                                                                               list[str]]:
+        """([(version, file, accounts)], [accounts skipped: daily cap]). Posting all versions, TikTok gets only
+        tiktok_version (unless that is 'all'); an account at its daily cap is left out, the others still post."""
+        files = self.posting_files(clip, version)
+        names = [n for n, _ in files]
+        tiktok_pick = self.s.tiktok_version if self.s.tiktok_version in names else names[0]
+        used = self.uploads_today()
+        plan, capped = [], []
+        for name, video in files:
+            targets = []
+            for a in accounts:
+                if (version == "all" and network_of(a) == "tiktok" and self.s.tiktok_version != "all"
+                        and name != tiktok_pick):
+                    continue
+                if used.get(a, 0) + used.get("*", 0) >= self.cap_for(a):
+                    if a not in capped:
+                        capped.append(a)
+                    continue
+                used[a] = used.get(a, 0) + 1
+                targets.append(a)
+            if targets:
+                plan.append((name, video, targets))
+        return plan, capped
 
     def should_auto_post(self, rating: float) -> bool:
         """auto_approve posts every clip; auto_post_min_rating > 0 posts the ones rated at least that."""
@@ -361,7 +425,7 @@ class Pipeline:
                 pass
         for w in list(self.workers.values()):
             w.request_stop()
-        await self.wait_idle()
+        await self.wait_idle(timeout=900)  # the last clips (headline + three versions) take a few minutes each
 
     async def wait_idle(self, timeout: float = 120.0) -> None:
         deadline = time.time() + timeout
@@ -431,14 +495,14 @@ class Pipeline:
         accts = accounts if accounts is not None else self.s.default_account_ids()
         if not accts:
             raise ClipError("select at least one social account (or set default accounts in Settings)")
-        uploads = len(self.posting_files(clip, version))
-        if self.db.count_uploads_since(time.time() - 86400) + uploads > self.s.max_posts_per_day:
-            raise ClipError(f"daily post cap reached ({self.s.max_posts_per_day} uploads a day)")
+        plan, capped = self.post_plan(clip, version, accts)
+        if not plan:
+            raise ClipError(f"daily post cap reached for {', '.join(network_of(a) for a in capped)}")
         if not self.db.claim_clip(clip_id, ("pending", "failed"), "posting"):
             raise ClipError(f"clip is {clip['status']}, cannot approve")
         cap = caption if caption is not None and caption.strip() else (clip["caption"] or "")
         self.db.update_clip(clip_id, caption=cap, accounts=",".join(accts), post_error="")
-        self._spawn(self._do_post(clip_id, version))
+        self._spawn(self._do_post(clip_id, plan, capped, named=version == "all"))
         return self.db.get_clip(clip_id)  # type: ignore[return-value]
 
     def posting_files(self, clip: dict, version: str) -> list[tuple[str, Path]]:
@@ -449,54 +513,37 @@ class Pipeline:
         out = [("headline", Path(clip["path"]))]
         if clip.get("headline") and self.base_path(clip["id"]).exists():
             out.append(("plain", self.base_path(clip["id"])))
-        if self.full_path(clip["id"]).exists():
-            out.append(("full", self.full_path(clip["id"])))
+        if self.full_file(clip["id"]):
+            out.append(("full", self.full_file(clip["id"])))
         return out
 
-    async def _do_post(self, clip_id: int, version: str = "headline") -> None:
-        if version == "all":
-            return await self._do_post_all(clip_id)
+    async def _do_post(self, clip_id: int, plan: list[tuple[str, Path, list[str]]], capped: list[str],
+                       named: bool = False) -> None:
+        """Post each planned version as its own post. Any success marks the clip posted (so a retry can't post
+        the ones that went out twice); failures and accounts left out (daily cap) are listed in post_error."""
         clip = self.db.get_clip(clip_id)
-        video = self.version_file(clip, version)
-        try:
-            res = await self.poster.publish(video, clip["caption"], clip["accounts"].split(","),
-                                            external_id=f"clip-{clip_id}")
-            partial = res.get("partial_error", "")  # combined providers: some posted, some failed
-            self.db.update_clip(clip_id, status="posted", post_id=res["post_id"], posted_at=time.time(),
-                                post_error=partial[:300])
-            if partial:
-                await self.notifier.notify_posted(clip, False, f"partly posted: {partial}"[:300])
-            else:
-                await self.notifier.notify_posted(clip, True, f"-> {len(clip['accounts'].split(','))} account(s)")
-        except Exception as e:
-            log.exception("posting clip %s failed", clip_id)
-            self.db.update_clip(clip_id, status="failed", post_error=str(e)[:300])
-            await self.notifier.notify_posted(clip, False, str(e)[:150])
-
-    async def _do_post_all(self, clip_id: int) -> None:
-        """Post every version of the clip as its own post. Any success marks the clip posted (so a retry can't
-        post the ones that went out twice); the failures are listed in post_error."""
-        clip = self.db.get_clip(clip_id)
-        ids, errors = [], []
-        for name, video in self.posting_files(clip, "all"):
+        everyone = clip["accounts"].split(",")
+        ids = []
+        errors = [f"{', '.join(network_of(a) for a in capped)}: daily cap reached, not posted there"] if capped else []
+        for name, video, targets in plan:
             try:
-                res = await self.poster.publish(video, clip["caption"], clip["accounts"].split(","),
-                                                external_id=f"clip-{clip_id}-{name}")
-                ids.append(f"{name}={res['post_id']}")
-                if res.get("partial_error"):
+                res = await self.poster.publish(video, clip["caption"], targets,
+                                                external_id=f"clip-{clip_id}-{name}" if named else f"clip-{clip_id}")
+                entry = f"{name}={res['post_id']}" if named else res["post_id"]
+                ids.append(entry + ("" if targets == everyone else "@" + "+".join(targets)))
+                if res.get("partial_error"):  # combined providers: some posted, some failed
                     errors.append(f"{name}: {res['partial_error']}")
             except Exception as e:
                 log.exception("posting %s version of clip %s failed", name, clip_id)
-                errors.append(f"{name}: {e}")
+                errors.append(f"{name}: {e}" if named else str(e))
         if not ids:
             self.db.update_clip(clip_id, status="failed", post_error="; ".join(errors)[:300])
             await self.notifier.notify_posted(clip, False, "; ".join(errors)[:150])
             return
         self.db.update_clip(clip_id, status="posted", post_id=",".join(ids), posted_at=time.time(),
                             post_error="; ".join(errors)[:300])
-        await self.notifier.notify_posted(clip, not errors, f"{len(ids)} version(s) -> "
-                                          f"{len(clip['accounts'].split(','))} account(s)"
-                                          + (f"; failed: {'; '.join(errors)}" if errors else ""))
+        where = ", ".join(f"{name} -> {'+'.join(network_of(a) for a in t)}" for name, _, t in plan)
+        await self.notifier.notify_posted(clip, not errors, (where + (f"; {'; '.join(errors)}" if errors else ""))[:300])
 
     def reject(self, clip_id: int) -> dict:
         clip = self.db.get_clip(clip_id)

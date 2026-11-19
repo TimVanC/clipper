@@ -143,11 +143,10 @@ class Database:
                         (since_ts,))
         return int(row["n"]) if row else 0
 
-    def count_uploads_since(self, since_ts: float) -> int:
-        """Uploads, not clips: a clip posted in all its versions ('headline=..,plain=..,full=..') counts each."""
-        rows = self._all("SELECT post_id FROM clips WHERE status IN ('posted','posting') AND decided_at>=?",
+    def posts_since(self, since_ts: float) -> list[dict]:
+        """accounts + post_id of the clips posted (or posting) since since_ts, for the daily caps."""
+        return self._all("SELECT accounts, post_id FROM clips WHERE status IN ('posted','posting') AND decided_at>=?",
                          (since_ts,))
-        return sum(max(1, (r["post_id"] or "").count("=")) for r in rows)
 
     def fail_interrupted_posts(self) -> list[int]:
         """Clips left in 'posting' by a stopped app. They may have reached some networks, so they become

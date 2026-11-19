@@ -131,7 +131,8 @@ def create_app(pl: Pipeline, start_pipeline: bool = True) -> FastAPI:
             raise HTTPException(400, str(e))
         if download:  # Content-Disposition: attachment, for manual posting
             safe = re.sub(r"[^A-Za-z0-9_.-]", "_", c.get("handle") or "clip")
-            suffix = {pl.base_path(cid): "-no-headline", pl.full_path(cid): "-full-frame"}.get(path, "")
+            suffix = {pl.base_path(cid): "-no-headline", pl.full_path(cid): "-full-frame",
+                      pl.full_path(cid, base=True): "-full-frame"}.get(path, "")
             return FileResponse(path, media_type="video/mp4", filename=f"{safe}-clip-{cid}{suffix}.mp4")
         return FileResponse(path, media_type="video/mp4")
 

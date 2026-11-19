@@ -80,6 +80,23 @@ async def test_approve_posts_the_chosen_version(pipeline, tmp_path, version, exp
     assert expected in route.calls[0].request.content
 
 
+async def test_full_frame_version_has_no_text(pipeline, tmp_path):
+    src = tmp_path / "s.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=white:s=1280x720:r=30:d=3",
+                    "-f", "lavfi", "-i", "sine=d=3", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-shortest", str(src)], check=True)
+    cid = _clip(pipeline, tmp_path, versions=())
+    await pipeline.make_full_version(cid, [(str(src), 0.5, 2.0)])
+    assert pipeline.full_file(cid) == pipeline.full_path(cid) and not pipeline.full_path(cid, base=True).exists()
+    assert _frame(pipeline.full_path(cid))[:CLASSIC_TOP].max() < 40  # nothing above the frame
+    # older clips kept a titled <id>_full.mp4 next to a text-free <id>_full_base.mp4: post the text-free one
+    old = _clip(pipeline, tmp_path)
+    pipeline.full_path(old, base=True).write_bytes(b"NOTEXT")
+    clip = pipeline.db.get_clip(old)
+    assert pipeline.version_file(clip, "full").read_bytes() == b"NOTEXT"
+    assert dict(pipeline.posting_files(clip, "all"))["full"].read_bytes() == b"NOTEXT"
+
+
 async def test_versions_fall_back_and_reject_unknown(pipeline, tmp_path):
     cid = _clip(pipeline, tmp_path, versions=())
     clip = pipeline.db.get_clip(cid)
@@ -91,23 +108,63 @@ async def test_versions_fall_back_and_reject_unknown(pipeline, tmp_path):
 
 
 @respx.mock
-async def test_all_versions_are_posted_separately_and_counted_against_the_cap(pipeline, tmp_path):
+async def test_all_versions_tiktok_gets_one_youtube_gets_all(pipeline, tmp_path):
     route = respx.post(f"{UP}/api/upload").respond(json={"success": True, "request_id": "r"})
+    pipeline.s.default_accounts = "default:tiktok,default:youtube"
     pipeline.s.max_posts_per_day = 4
     cid = _clip(pipeline, tmp_path)
     await pipeline.approve(cid, version="all")
     await pipeline.wait_idle()
     clip = pipeline.db.get_clip(cid)
     bodies = [c.request.content for c in route.calls]
-    assert clip["status"] == "posted" and clip["post_id"] == "headline=r,plain=r,full=r"
+    assert clip["status"] == "posted" and not clip["post_error"]
+    assert clip["post_id"] == "headline=r,plain=r@default:youtube,full=r@default:youtube"
     assert [b"MAIN" in b for b in bodies] == [True, False, False] and b"FULL" in bodies[2]
+    assert [b"tiktok" in b for b in bodies] == [True, False, False] and all(b"youtube" in b for b in bodies)
     assert all(b'name="external_id"' in b for b in bodies) and b"clip-%d-full" % cid in bodies[2]
-    assert pipeline.db.count_uploads_since(0) == 3
-    second = _clip(pipeline, tmp_path)  # 3 + 3 > 4: refused; one more single upload still fits
-    with pytest.raises(ClipError, match="daily post cap"):
-        await pipeline.approve(second, version="all")
-    await pipeline.approve(second, version="headline")
+    assert pipeline.uploads_today() == {"default:tiktok": 1, "default:youtube": 3}
+    # YouTube has 1 of its 4 left: the next clip goes out once there, TikTok still gets its version
+    second = _clip(pipeline, tmp_path)
+    await pipeline.approve(second, version="all")
     await pipeline.wait_idle()
+    clip = pipeline.db.get_clip(second)
+    assert clip["status"] == "posted" and clip["post_id"] == "headline=r" and len(route.calls) == 4
+    pipeline.s.tiktok_version = "full"  # TikTok's pick; YouTube is full: only TikTok, with the full frame
+    third = _clip(pipeline, tmp_path)
+    await pipeline.approve(third, version="all")
+    await pipeline.wait_idle()
+    clip = pipeline.db.get_clip(third)
+    assert clip["post_id"] == "full=r@default:tiktok" and "youtube: daily cap" in clip["post_error"]
+    assert b"FULL" in route.calls[4].request.content
+    pipeline.s.max_posts_per_day = 2  # both at their cap now: refused outright
+    with pytest.raises(ClipError, match="daily post cap reached for youtube, tiktok"):
+        await pipeline.approve(_clip(pipeline, tmp_path), version="all")
+
+
+def test_old_post_ids_count_every_account(pipeline, tmp_path):
+    a, b = _clip(pipeline, tmp_path), _clip(pipeline, tmp_path)
+    pipeline.db.update_clip(a, status="posted", accounts="default:tiktok,default:youtube",
+                            post_id="headline=x,plain=y,full=z")  # before: every version went everywhere
+    pipeline.db.update_clip(b, status="posted", accounts="default:tiktok,default:youtube", post_id="sp")
+    for cid in (a, b):
+        pipeline.db.claim_clip(cid, ("posted",), "posted")
+    assert pipeline.uploads_today() == {"default:tiktok": 4, "default:youtube": 4}
+
+
+@respx.mock
+async def test_cap_ignores_posts_made_through_a_previous_provider(pipeline, tmp_path):
+    respx.post(f"{UP}/api/upload").respond(json={"success": True, "request_id": "r"})
+    pipeline.s.max_posts_per_day, pipeline.s.tiktok_version = 3, "all"
+    old = _clip(pipeline, tmp_path)  # posted earlier today through Postproxy + Upload-Post combined
+    pipeline.db.update_clip(old, status="posted", accounts="postproxy/AnUZrZ,uploadpost/default:youtube",
+                            post_id="postproxy:x,uploadpost:y")
+    pipeline.db.claim_clip(old, ("posted",), "posted")  # sets decided_at = now
+    assert not pipeline.same_setup("postproxy/AnUZrZ,uploadpost/default:youtube")
+    assert pipeline.same_setup("default:tiktok,default:youtube")
+    cid = _clip(pipeline, tmp_path)
+    await pipeline.approve(cid, version="all")  # 0 counted + 3 <= 3
+    await pipeline.wait_idle()
+    assert pipeline.db.get_clip(cid)["status"] == "posted"
 
 
 @respx.mock
@@ -115,6 +172,7 @@ async def test_all_versions_partial_failure(pipeline, tmp_path):
     respx.post(f"{UP}/api/upload").mock(side_effect=[
         httpx.Response(200, json={"success": True, "request_id": "a"}), httpx.Response(500, text="boom"),
         httpx.Response(200, json={"success": True, "request_id": "c"})])
+    pipeline.s.tiktok_version = "all"
     cid = _clip(pipeline, tmp_path)
     await pipeline.approve(cid, version="all")
     await pipeline.wait_idle()
