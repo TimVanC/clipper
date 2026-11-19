@@ -1,4 +1,5 @@
 import subprocess
+import time
 
 import httpx
 import numpy as np
@@ -69,15 +70,58 @@ def _clip(pl, tmp_path, versions=("headline", "plain", "full")):
     return cid
 
 
+def _uploads(route_ids=None):
+    """Mock Upload-Post's upload endpoint: request ids r1, r2, ..."""
+    n = iter(range(1, 1000))
+    return respx.post(f"{UP}/api/upload").mock(
+        side_effect=lambda req: httpx.Response(200, json={"success": True, "request_id": f"r{next(n)}"}))
+
+
+def _status(results: dict):
+    """Mock the status endpoint: request id -> one result dict (missing = still processing)."""
+    def answer(req):
+        res = results.get(req.url.params["request_id"])
+        if res is None:
+            return httpx.Response(200, json={"status": "pending", "results": []})
+        return httpx.Response(200, json={"status": "completed", "results": [res]})
+    return respx.get(f"{UP}/api/uploadposts/status").mock(side_effect=answer)
+
+
+def _live(url="https://www.tiktok.com/@x/video/1"):
+    return {"platform": "tiktok", "success": True, "post_url": url}
+
+
+YT_LIMIT = {"platform": "youtube", "success": False, "error_code": "youtube_channel_daily_limit",
+            "error_message": "This YouTube channel has reached the number of videos it may upload today. "
+                             "The limit is set by YouTube per channel."}
+TT_SPAM = {"platform": "tiktok", "success": False, "error_code": "unknown_error",
+           "error_message": "This TikTok creator has made too many posts via OpenAPI in the last 24 hours, so "
+                            "this publishing attempt is blocked to minimize spam. Try later."}
+
+
+def _uploads_of(pl, cid):
+    return [(u["version"], u["account"].split(":")[-1], u["state"]) for u in pl.db.uploads_for(cid)]
+
+
 @respx.mock
 @pytest.mark.parametrize("version,expected", [("headline", b"MAIN"), ("plain", b"PLAIN"), ("full", b"FULL")])
-async def test_approve_posts_the_chosen_version(pipeline, tmp_path, version, expected):
-    route = respx.post(f"{UP}/api/upload").respond(json={"success": True, "request_id": "r"})
+async def test_approve_posts_the_chosen_version_and_checks_it_went_live(pipeline, tmp_path, version, expected):
+    route = _uploads()
+    status = _status({})
     cid = _clip(pipeline, tmp_path)
-    await pipeline.approve(cid, version=version)
+    assert (await pipeline.approve(cid, version=version))["status"] == "queued"
     await pipeline.wait_idle()
-    assert pipeline.db.get_clip(cid)["status"] == "posted"
-    assert expected in route.calls[0].request.content
+    assert expected in route.calls[0].request.content and b"clip-%d-%s" % (cid, version.encode()) in route.calls[0].request.content
+    assert _uploads_of(pipeline, cid) == [(version, "tiktok", "processing")]
+    await pipeline.check_uploads()  # the network hasn't answered yet: still queued
+    assert pipeline.db.get_clip(cid)["status"] == "queued" and status.call_count == 1
+    status.side_effect = _status({"r1": _live("https://tt/1")}).side_effect
+    await pipeline.check_uploads()
+    clip = pipeline.db.get_clip(cid)
+    assert clip["status"] == "posted" and clip["post_id"] == "r1" and not clip["post_error"]
+    assert pipeline.db.uploads_for(cid)[0]["url"] == "https://tt/1"
+    assert clip["path"] == "" and not (pipeline.clips_dir / f"{cid}.mp4").exists()  # it's live: no local copy
+    assert not pipeline.base_path(cid).exists() and not pipeline.full_path(cid).exists()
 
 
 async def test_full_frame_version_has_no_text(pipeline, tmp_path):
@@ -86,6 +130,7 @@ async def test_full_frame_version_has_no_text(pipeline, tmp_path):
                     "-f", "lavfi", "-i", "sine=d=3", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
                     "-c:a", "aac", "-shortest", str(src)], check=True)
     cid = _clip(pipeline, tmp_path, versions=())
+    pipeline.s.auto_post_version = "full"  # only rendered when a network posts it
     await pipeline.make_full_version(cid, [(str(src), 0.5, 2.0)])
     assert pipeline.full_file(cid) == pipeline.full_path(cid) and not pipeline.full_path(cid, base=True).exists()
     assert _frame(pipeline.full_path(cid))[:CLASSIC_TOP].max() < 40  # nothing above the frame
@@ -107,64 +152,92 @@ async def test_versions_fall_back_and_reject_unknown(pipeline, tmp_path):
     assert not pipeline.base_path(cid).exists() and not pipeline.full_path(cid).exists()
 
 
+def test_each_network_gets_its_own_version(pipeline, tmp_path):
+    clip = pipeline.db.get_clip(_clip(pipeline, tmp_path))
+    both = ["default:tiktok", "default:youtube"]
+    assert pipeline.jobs_for(clip, "all", both) == [("headline", "default:tiktok"), ("headline", "default:youtube")]
+    pipeline.s.youtube_version, pipeline.s.tiktok_version = "all", "full"
+    assert pipeline.jobs_for(clip, "all", both) == [("full", "default:tiktok"), ("headline", "default:youtube"),
+                                                     ("plain", "default:youtube"), ("full", "default:youtube")]
+    assert pipeline.jobs_for(clip, "plain", both) == [("plain", "default:tiktok"), ("plain", "default:youtube")]
+
+
 @respx.mock
-async def test_all_versions_tiktok_gets_one_youtube_gets_all(pipeline, tmp_path):
-    route = respx.post(f"{UP}/api/upload").respond(json={"success": True, "request_id": "r"})
-    pipeline.s.default_accounts = "default:tiktok,default:youtube"
-    pipeline.s.max_posts_per_day = 4
+async def test_queue_respects_daily_allowance_gap_and_rating(pipeline, tmp_path):
+    route = _uploads()
+    pl, s = pipeline, pipeline.s
+    s.tiktok_per_day, s.post_gap_min = 3, 60
+    earlier = pl.db.add_upload(_clip(pl, tmp_path), "headline", "default:tiktok", state="live")  # just posted
+    low, high, mid = (_clip(pl, tmp_path) for _ in range(3))
+    for cid, score in ((low, 2.0), (high, 9.0), (mid, 5.0)):
+        pl.db._exec("UPDATE clips SET score=? WHERE id=?", (score, cid))
+        await pl.approve(cid)
+    await pl.wait_idle()
+    assert route.call_count == 0 and {pl.db.get_clip(c)["status"] for c in (low, high, mid)} == {"queued"}
+    assert pl.slot_at("default:tiktok") == pytest.approx(time.time() + 3600, abs=5)  # the gap
+    pl.db._exec("UPDATE uploads SET sent_at=? WHERE id=?", (time.time() - 7200, earlier))
+    await pl.run_queue()  # one slot: the best-rated clip goes first, the gap holds the others
+    assert route.call_count == 1 and _uploads_of(pl, high) == [("headline", "tiktok", "processing")]
+    s.post_gap_min = 0
+    await pl.run_queue()  # 3 a day: the earlier post + 2 from the queue
+    assert route.call_count == 2 and pl.db.uploads_for(mid) and not pl.db.uploads_for(low)
+    assert pl.db.get_clip(low)["status"] == "queued"
+    assert pl.slot_at("default:tiktok") == pytest.approx(time.time() - 7200 + 86400, abs=5)
+    slots = pl.posting_slots()
+    assert [(x["network"], x["used"], x["cap"]) for x in slots] == [("tiktok", 3, 3)]
+
+
+@respx.mock
+async def test_turned_down_uploads_are_retried_later_and_reported(pipeline, tmp_path):
+    _uploads()
+    pl = pipeline
+    pl.s.default_accounts, pl.s.post_gap_min = "default:tiktok,default:youtube", 0
+    cid = _clip(pl, tmp_path)
+    await pl.approve(cid, version="all")
+    await pl.wait_idle()
+    assert sorted(_uploads_of(pl, cid)) == [("headline", "tiktok", "processing"), ("headline", "youtube", "processing")]
+    by_net = {u["account"]: u["request_id"] for u in pl.db.uploads_for(cid)}
+    _status({by_net["default:tiktok"]: _live(), by_net["default:youtube"]: YT_LIMIT})
+    await pl.check_uploads()
+    # YouTube said no for today: still queued for it, and YouTube rests before the next try
+    assert pl.db.get_clip(cid)["status"] == "queued"
+    assert pl.slot_at("default:youtube") > time.time() + 2 * 3600
+    assert ("headline", "youtube", "limited") in _uploads_of(pl, cid)
+    pl.db._exec("UPDATE clips SET decided_at=? WHERE id=?", (time.time() - 13 * 3600, cid))  # waited too long
+    await pl.run_queue()
+    clip = pl.db.get_clip(cid)
+    assert clip["status"] == "posted" and "youtube headline: not posted (This YouTube channel has reached" in clip["post_error"]
+    # nothing went live and only limits: back to Review; a retry clears the old attempts
+    other = _clip(pl, tmp_path)
+    pl.s.default_accounts = "default:tiktok"
+    pl.db._exec("UPDATE uploads SET sent_at=sent_at-86400")  # yesterday: frees TikTok's slots
+    await pl.approve(other)
+    await pl.wait_idle()
+    rid = pl.db.uploads_for(other)[0]["request_id"]
+    _status({rid: TT_SPAM})
+    await pl.check_uploads()
+    pl.db._exec("UPDATE clips SET decided_at=? WHERE id=?", (time.time() - 13 * 3600, other))
+    await pl.run_queue()
+    back = pl.db.get_clip(other)
+    assert back["status"] == "pending" and "too many posts" in back["post_error"] and "Approve it again" in back["post_error"]
+    pl.db._exec("UPDATE uploads SET sent_at=sent_at-86400")
+    await pl.approve(other)
+    await pl.wait_idle()
+    assert [u["state"] for u in pl.db.uploads_for(other)] == ["processing"]
+
+
+@respx.mock
+async def test_upload_errors_fail_the_clip_and_restart_cuts_are_failed(pipeline, tmp_path):
+    respx.post(f"{UP}/api/upload").respond(500, text="boom")
     cid = _clip(pipeline, tmp_path)
-    await pipeline.approve(cid, version="all")
+    await pipeline.approve(cid)
     await pipeline.wait_idle()
     clip = pipeline.db.get_clip(cid)
-    bodies = [c.request.content for c in route.calls]
-    assert clip["status"] == "posted" and not clip["post_error"]
-    assert clip["post_id"] == "headline=r,plain=r@default:youtube,full=r@default:youtube"
-    assert [b"MAIN" in b for b in bodies] == [True, False, False] and b"FULL" in bodies[2]
-    assert [b"tiktok" in b for b in bodies] == [True, False, False] and all(b"youtube" in b for b in bodies)
-    assert all(b'name="external_id"' in b for b in bodies) and b"clip-%d-full" % cid in bodies[2]
-    assert pipeline.uploads_today() == {"default:tiktok": 1, "default:youtube": 3}
-    # YouTube has 1 of its 4 left: the next clip goes out once there, TikTok still gets its version
-    second = _clip(pipeline, tmp_path)
-    await pipeline.approve(second, version="all")
-    await pipeline.wait_idle()
-    clip = pipeline.db.get_clip(second)
-    assert clip["status"] == "posted" and clip["post_id"] == "headline=r" and len(route.calls) == 4
-    pipeline.s.tiktok_version = "full"  # TikTok's pick; YouTube is full: only TikTok, with the full frame
-    third = _clip(pipeline, tmp_path)
-    await pipeline.approve(third, version="all")
-    await pipeline.wait_idle()
-    clip = pipeline.db.get_clip(third)
-    assert clip["post_id"] == "full=r@default:tiktok" and "youtube: daily cap" in clip["post_error"]
-    assert b"FULL" in route.calls[4].request.content
-    pipeline.s.max_posts_per_day = 2  # both at their cap now: refused outright
-    with pytest.raises(ClipError, match="daily post cap reached for youtube, tiktok"):
-        await pipeline.approve(_clip(pipeline, tmp_path), version="all")
-
-
-def test_old_post_ids_count_every_account(pipeline, tmp_path):
-    a, b = _clip(pipeline, tmp_path), _clip(pipeline, tmp_path)
-    pipeline.db.update_clip(a, status="posted", accounts="default:tiktok,default:youtube",
-                            post_id="headline=x,plain=y,full=z")  # before: every version went everywhere
-    pipeline.db.update_clip(b, status="posted", accounts="default:tiktok,default:youtube", post_id="sp")
-    for cid in (a, b):
-        pipeline.db.claim_clip(cid, ("posted",), "posted")
-    assert pipeline.uploads_today() == {"default:tiktok": 4, "default:youtube": 4}
-
-
-@respx.mock
-async def test_cap_ignores_posts_made_through_a_previous_provider(pipeline, tmp_path):
-    respx.post(f"{UP}/api/upload").respond(json={"success": True, "request_id": "r"})
-    pipeline.s.max_posts_per_day, pipeline.s.tiktok_version = 3, "all"
-    old = _clip(pipeline, tmp_path)  # posted earlier today through Postproxy + Upload-Post combined
-    pipeline.db.update_clip(old, status="posted", accounts="postproxy/AnUZrZ,uploadpost/default:youtube",
-                            post_id="postproxy:x,uploadpost:y")
-    pipeline.db.claim_clip(old, ("posted",), "posted")  # sets decided_at = now
-    assert not pipeline.same_setup("postproxy/AnUZrZ,uploadpost/default:youtube")
-    assert pipeline.same_setup("default:tiktok,default:youtube")
-    cid = _clip(pipeline, tmp_path)
-    await pipeline.approve(cid, version="all")  # 0 counted + 3 <= 3
-    await pipeline.wait_idle()
-    assert pipeline.db.get_clip(cid)["status"] == "posted"
+    assert clip["status"] == "failed" and "tiktok headline:" in clip["post_error"] and "500" in clip["post_error"]
+    held = _clip(pipeline, tmp_path)
+    pipeline.db.add_upload(held, "headline", "default:tiktok")  # 'sending' when the app stopped
+    assert pipeline.db.fail_interrupted_uploads() == [held]
+    assert pipeline.db.uploads_in("sending") == [] and "check the profile" in pipeline.db.uploads_for(held)[0]["error"]
 
 
 @respx.mock
@@ -172,12 +245,14 @@ async def test_all_versions_partial_failure(pipeline, tmp_path):
     respx.post(f"{UP}/api/upload").mock(side_effect=[
         httpx.Response(200, json={"success": True, "request_id": "a"}), httpx.Response(500, text="boom"),
         httpx.Response(200, json={"success": True, "request_id": "c"})])
-    pipeline.s.tiktok_version = "all"
+    _status({"a": _live(), "c": _live()})
+    pipeline.s.tiktok_version, pipeline.s.post_gap_min = "all", 0
     cid = _clip(pipeline, tmp_path)
     await pipeline.approve(cid, version="all")
     await pipeline.wait_idle()
+    await pipeline.check_uploads()
     clip = pipeline.db.get_clip(cid)
-    assert clip["status"] == "posted" and clip["post_id"] == "headline=a,full=c" and "plain" in clip["post_error"]
+    assert clip["status"] == "posted" and clip["post_id"] == "a,c" and "tiktok plain:" in clip["post_error"]
 
 
 async def test_clip_without_headline_has_no_separate_plain_version(pipeline, tmp_path):

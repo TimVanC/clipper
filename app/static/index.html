@@ -41,7 +41,8 @@
           text-decoration:none; display:inline-block; text-align:center; }
   a.btn.ghost { background:#222633; color:var(--txt); }
   .tag.rate { color:#c9a227; } .tag.rate.great { color:#ffcc33; font-weight:600; } .tag.rate.weak { color:var(--mut); }
-  .tag.posted, .tag.approved { color:var(--ok); } .tag.failed { color:var(--bad); } .tag.posting { color:var(--warn); }
+  .tag.posted, .tag.approved { color:var(--ok); } .tag.failed { color:var(--bad); } .tag.posting, .tag.queued { color:var(--warn); } .tag.expired { color:var(--mut); }
+  .ups { margin-top:6px; font-size:13px; } .ups div { margin:2px 0; } .ups a { color:var(--acc); }
   .err { color:var(--bad); font-size:13px; margin-top:6px; }
   .accts label { display:flex; align-items:center; gap:8px; color:var(--txt); font-size:14px; margin:4px 0; }
   .accts input { width:auto; }
@@ -88,6 +89,30 @@ async function api(path, opts={}) {
 }
 function toast(msg) { const t=$('#toast'); t.textContent=msg; t.style.display='block'; setTimeout(()=>t.style.display='none', 3500); }
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const clock = ts => new Date(ts*1000).toLocaleTimeString([], {hour:'numeric', minute:'2-digit'});
+const UPLOAD_STATE = {sending:'⏳ uploading', processing:'⏳ waiting for the network', live:'✅ live',
+                      failed:'⛔ failed', limited:'↻ turned down (daily limit), trying again later'};
+function uploadsHTML(c) {
+  const rows = (c.uploads||[]).map(u => `<div>${esc(u.network)} · ${esc(u.version)} · ${UPLOAD_STATE[u.state]||esc(u.state)}${
+      u.url?` <a href="${esc(u.url)}" target="_blank" rel="noopener">open ↗</a>`:''}${
+      u.error&&u.state!=='live'?` <span class="mut">${esc(u.error)}</span>`:''}</div>`).join('');
+  const waiting = c.status==='queued' ? `<div class="mut">Queued: goes out when the account has a free slot (best-rated first).</div>` : '';
+  return rows||waiting ? `<div class="ups">${rows}${waiting}</div>` : '';
+}
+function diskHTML() {
+  const d = state.disk||{}, st = state.settings;
+  if (d.recordings_gb === undefined && d.clips_gb === undefined) return '';
+  return `<div class="card mut">Disk: recordings ${d.recordings_gb ?? 0} of ${st.max_buffer_gb} GB · clips ${d.clips_gb ?? 0} of ${st.max_clips_gb} GB.
+    Posted clips are deleted once live, unposted ones after ${st.clip_keep_hours} h.</div>`;
+}
+function slotsHTML() {
+  const sl = state.slots||[];
+  if (!sl.length) return diskHTML();
+  const now = Date.now()/1000;
+  return `<h2>Posting today</h2><div class="card">${sl.map(x => `<div class="row"><b class="grow">${esc(x.network)}</b>
+      <span class="mut">${x.used}/${x.cap} in 24h · ${x.next<=now+30?'free now':'next '+clock(x.next)}</span></div>`).join('')}
+      <div class="mut" style="margin-top:6px">${(state.counts||{}).queued||0} clip(s) queued.</div></div>${diskHTML()}`;
+}
 const ago = ts => { if(!ts) return 'never'; const s=Math.max(0,Date.now()/1000-ts); return s<90?`${s|0}s ago`:s<5400?`${(s/60)|0}m ago`:`${(s/3600)|0}h ago`; };
 
 async function refresh(force) {
@@ -178,7 +203,7 @@ function liveHTML() {
         ? ` starting <b>${esc(new Date(startTs*1000).toLocaleString([], {weekday:'short', hour:'numeric', minute:'2-digit'}))}</b>` : ''}.
         Change it in Settings.</div>`
     : `<div class="card mut">Category auto-watch is off. Set it in Settings, e.g. Grand Theft Auto VI.</div>`;
-  return `<h2>Live now</h2>${auto}${live || '<div class="card mut">Nobody live right now.</div>'}
+  return `${slotsHTML()}<h2>Live now</h2>${auto}${live || '<div class="card mut">Nobody live right now.</div>'}
     <h2>Tracked streamers</h2>${sts || '<div class="card mut">Add a streamer below.</div>'}
     <div class="card"><div class="row"><select id="n-plat" style="width:110px" onfocus="editing=true" onblur="editing=false">
       <option>twitch</option><option>kick</option><option>youtube</option></select>
@@ -193,6 +218,7 @@ function historyHTML() {
   return clips.map(c => `<div class="card"><div class="row"><b class="grow">${esc(c.handle)}</b>
       <span class="tag ${c.status}">${c.status}</span></div>
       <div class="mut">#${c.id} · ${(c.end_s-c.start_s)|0}s · ${stars(c.rating)} ${c.rating.toFixed(1)} ${esc(c.rating_label)} · ${ago(c.created_at)}</div>
+      ${uploadsHTML(c)}
       ${c.post_error?`<div class="err">${esc(c.post_error)}</div>`:''}
       ${c.status==='failed'&&c.has_video?`<button class="btn" style="margin-top:8px" onclick="approve(${c.id})">Retry post</button>`:''}
       ${c.has_video&&(c.status==='approved'||(isManual()&&c.status!=='rejected'))?`<div style="margin-top:8px">${downloadBtn(c)}</div>`:''}</div>`).join('');
@@ -204,9 +230,14 @@ const downloadBtn = c => `<a class="btn ghost" href="/api/clips/${c.id}/video?do
 
 const FIELDS = [
   ['default_accounts','Default account ids for the posting provider (comma separated)','text'],
-  ['auto_post_min_rating','Auto-post clips rated at least (0-10, 0 = never; the daily cap still applies)','number'],
+  ['auto_post_min_rating','Auto-post clips rated at least (0-10, 0 = never; they queue for a free slot)','number'],
   ['auto_post_version','Version auto-posting uses: headline, plain (no text), full (full frame) or all (each as its own post)','text'],
-  ['tiktok_version','Posting all versions: the one TikTok gets (headline, plain, full) or all; other networks get every version','text'],
+  ['tiktok_version','Posting all versions: the one TikTok gets (headline, plain, full) or all','text'],
+  ['youtube_version','Posting all versions: the one YouTube gets (headline, plain, full) or all','text'],
+  ['tiktok_per_day','TikTok uploads per 24h (more gets your videos shown less, past ~15 TikTok blocks them)','number'],
+  ['youtube_per_day','YouTube uploads per 24h (your channel turns uploads down past about 10)','number'],
+  ['post_gap_min','Minutes between two uploads to the same account','number'],
+  ['queue_hours','Hours an approved clip waits for a free slot before going back to Review','number'],
   ['headline_mode','On-screen headline: auto (Claude when ANTHROPIC_API_KEY is set, else none), claude, local (free, rough) or off','text'],
   ['caption_template','Caption template: {hook} {hashtags} {name} {game} {title} {streamer} {platform}','area'],
   ['caption_hooks','Opening lines, one per line, rotated per clip ({name}, {game}). Empty = built-in set','area'],
@@ -228,8 +259,11 @@ const FIELDS = [
   ['min_separation_s','Min gap between clips (s)','number'],
   ['max_clips_per_hour','Max clips per hour','number'],
   ['audio_weight','Audio weight','number'], ['chat_weight','Chat weight','number'],
-  ['poll_seconds','Live-check interval (s)','number'], ['chunk_seconds','Recording chunk length (s)','number'],
-  ['max_posts_per_day','Max uploads per account per day (each version counts; Upload-Post also caps TikTok at 15, YouTube at 30)','number'],
+  ['poll_seconds','Live-check interval (s)','number'], ['chunk_seconds','Recording chunk length (s; short = less on disk)','number'],
+  ['max_buffer_gb','Recordings: max GB on disk for all streams together (oldest chunks deleted first)','number'],
+  ['max_clips_gb','Clips: max GB on disk (oldest unposted clips deleted first)','number'],
+  ['clip_keep_hours','Clips: hours an unposted clip is kept for Review before its video is deleted','number'],
+  ['max_posts_per_day','Uploads per day for other networks (TikTok and YouTube have their own settings)','number'],
 ];
 function settingsHTML() {
   const s = state.settings, p = state.poster || {};
@@ -257,7 +291,7 @@ async function approve(id) {
   try { await api(`/api/clips/${id}/approve`, {method:'POST', body:{caption, accounts: accts, headline, version}});
         delete verSel[id];
         delete picked[id]; delete drafts[id]; delete heads[id];
-        toast(isManual() ? 'Approved. Download it from History' : 'Approved: posting…'); } catch(e) { toast(e.message); } refresh(true);
+        toast(isManual() ? 'Approved. Download it from History' : 'Approved: queued, see History for each upload'); } catch(e) { toast(e.message); } refresh(true);
 }
 async function applyHeadline(id) {
   const headline = $('#hl-'+id)?.value ?? '';

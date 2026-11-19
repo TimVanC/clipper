@@ -14,6 +14,7 @@ from .platforms.kick import KickClient
 from .platforms.twitch import TwitchClient
 from .platforms.youtube import YouTubeClient
 from .posters import make_poster
+from .recorder import contain_children
 from .web import create_app
 
 
@@ -38,6 +39,7 @@ def create() -> "FastAPI":  # noqa: F821
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     settings = Settings.from_env()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
+    contain_children()  # recorders die with the app, however it ends
     return create_app(build_pipeline(settings))
 
 

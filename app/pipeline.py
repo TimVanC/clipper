@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import shutil
 import time
@@ -15,11 +16,12 @@ from .clipper import ChunkIndex, make_preview, make_thumb, render_clip
 from .config import Settings, parse_categories, parse_start, split_list
 from . import headline
 from .facecam import choose_layout
-from .db import Database
+from .db import COUNTED_STATES, Database
 from .detector import DetectorConfig, HypeDetector, audio_db_per_second, decode_audio, SR
 from .notifier import DiscordNotifier
 from .platforms.base import LiveInfo, PlatformClient
 from .posters import Poster
+from .posters.base import is_limit
 from .rating import clip_rating
 from .recorder import Recorder, streamlink_source
 from .watcher import CategoryWatch, Watcher
@@ -49,9 +51,23 @@ def category_watch_from(s: Settings, now: float) -> CategoryWatch | None:
 
 VERSIONS = ("headline", "plain", "full")
 
-# posts per connected account per rolling 24h that Upload-Post lets through (docs.upload-post.com/guides/limit-of-uploads)
+# posts per connected account per rolling 24h that Upload-Post lets through (docs.upload-post.com/guides/limit-of-uploads);
+# the networks themselves allow less (see tiktok_per_day / youtube_per_day)
 NETWORK_CAPS = {"tiktok": 15, "youtube": 30, "instagram": 50, "facebook": 25, "threads": 50, "linkedin": 150,
                 "pinterest": 20, "x": 10, "bluesky": 25}
+
+
+LIMIT_BACKOFF_S = 3 * 3600   # an account a network turned down for a daily limit rests this long
+CHECK_GIVE_UP_S = 6 * 3600   # an upload the network still hasn't answered for after this is failed
+QUEUE_TICK_S = 60.0          # how often the queue posts and checks uploads
+
+
+def format_plan(jobs: list[tuple[str, str]]) -> str:
+    return ",".join(f"{v}>{a}" for v, a in jobs)
+
+
+def parse_plan(text: str) -> list[tuple[str, str]]:
+    return [tuple(x.split(">", 1)) for x in (text or "").split(",") if ">" in x]  # type: ignore[misc]
 
 
 def network_of(account: str) -> str:
@@ -81,6 +97,7 @@ class SessionWorker:
         self.index = ChunkIndex()
         self.walls: dict[int, float] = {}  # chunk start on the session timeline -> wall-clock time
         self.processed = 0
+        self.seen: set[str] = set()  # chunk names already analysed (older ones get deleted, so not by position)
         self.clips = 0
         self.task: asyncio.Task | None = None
 
@@ -116,13 +133,24 @@ class SessionWorker:
             pl.db.end_session(self.session_id)
             if pl.s.delete_raw:
                 shutil.rmtree(self.dir / "raw", ignore_errors=True)
+                try:
+                    self.dir.rmdir()  # nothing else is kept per session
+                except OSError:
+                    pass
             pl.workers.pop((self.info.platform, self.info.handle.lower()), None)
             await pl.notifier.notify_offline(self.info.platform, self.info.handle, self.clips)
 
     async def _drain(self, final: bool) -> None:
         chunks = self.recorder.completed_chunks() if not final else sorted((self.dir / "raw").glob("chunk_*.ts"))
-        chunks = [c for c in chunks if c.stat().st_size > 0]
-        for path in chunks[self.processed:]:
+        for path in chunks:
+            if path.name in self.seen:
+                continue
+            try:
+                if path.stat().st_size == 0:
+                    continue
+            except FileNotFoundError:  # dropped by the recordings size cap before it was analysed
+                continue
+            self.seen.add(path.name)
             self.processed += 1
             try:
                 await self._process_chunk(path)
@@ -243,6 +271,9 @@ class Pipeline:
         self._bg: set[asyncio.Task] = set()
         self._last_live_notice: dict[tuple[str, str], float] = {}
         self._watch_task: asyncio.Task | None = None
+        self._queue_task: asyncio.Task | None = None
+        self._queue_lock = asyncio.Lock()
+        self.disk: dict[str, float] = {}
         self._claude = None  # anthropic.AsyncAnthropic, made on first use
         self.watcher = Watcher(
             clients,
@@ -280,7 +311,7 @@ class Pipeline:
 
     async def make_full_version(self, clip_id: int, pieces) -> None:
         """Render the full-frame version (no text) from the source pieces, while they still exist."""
-        if not self.s.full_frame_version:
+        if not self.wants_full():
             return
         full = self.full_path(clip_id)
         try:
@@ -288,6 +319,117 @@ class Pipeline:
         except Exception:
             log.exception("full-frame version failed for clip %s", clip_id)
             full.unlink(missing_ok=True)
+
+    def wants_full(self) -> bool:
+        """Render the full-frame version only when a network would post it (saves a render and disk)."""
+        if not self.s.full_frame_version:
+            return False
+        auto = self.s.auto_post_version
+        return auto == "full" or (auto == "all" and bool({self.s.tiktok_version, self.s.youtube_version} & {"full", "all"}))
+
+    # ---- disk -------------------------------------------------
+    def clip_files(self, clip: dict) -> list[Path]:
+        cid = clip["id"]
+        files = [self.base_path(cid), self.full_path(cid), self.full_path(cid, base=True),
+                 self.clips_dir / f"{cid}_preview.mp4"]
+        return ([Path(clip["path"])] if clip.get("path") else []) + files
+
+    def drop_clip_files(self, clip: dict) -> int:
+        """Delete a clip's videos (the small thumbnail stays for History). Returns the bytes freed."""
+        freed = 0
+        for f in self.clip_files(clip):
+            try:
+                size = f.stat().st_size
+                f.unlink()
+                freed += size
+            except FileNotFoundError:
+                pass
+            except OSError as e:  # e.g. being served to the browser right now: next pass
+                log.warning("couldn't delete %s: %s", f, e)
+        self.db.update_clip(clip["id"], path="")
+        return freed
+
+    def _expire(self, clip: dict, why: str) -> int:
+        if not self.db.claim_clip(clip["id"], ("pending", "failed"), "expired"):
+            return 0  # approved (or rejected) meanwhile
+        self.db.update_clip(clip["id"], post_error=why)
+        return self.drop_clip_files(clip)
+
+    @staticmethod
+    def _dir_bytes(paths) -> int:
+        total = 0
+        for f in paths:
+            try:
+                total += f.stat().st_size
+            except FileNotFoundError:
+                pass
+        return total
+
+    def sweep_recordings(self) -> int:
+        """Startup: nothing is recording yet, so every recorded chunk on disk is a leftover. Returns bytes freed."""
+        freed = 0
+        for d in list(self.sessions_dir.iterdir()):
+            if not d.is_dir():
+                continue
+            raw = d / "raw"
+            if raw.is_dir():
+                freed += self._dir_bytes(raw.rglob("*"))
+                shutil.rmtree(raw, ignore_errors=True)
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+        return freed
+
+    def enforce_buffer_cap(self) -> int:
+        """Recordings over max_buffer_gb: delete the oldest finished chunks (never one being written)."""
+        cap = self.s.max_buffer_gb * 1024 ** 3
+        old, total = [], 0
+        for raw in self.sessions_dir.glob("*/raw"):
+            chunks = sorted(raw.glob("chunk_*.ts"))
+            for i, f in enumerate(chunks):
+                try:
+                    st = f.stat()
+                except FileNotFoundError:
+                    continue
+                total += st.st_size
+                if i < len(chunks) - 1:
+                    old.append((st.st_mtime, st.st_size, f))
+        freed = 0
+        for _, size, f in sorted(old):
+            if total <= cap:
+                break
+            f.unlink(missing_ok=True)
+            total -= size
+            freed += size
+        if freed:
+            log.warning("recordings over %.1f GB: deleted %.1f GB of the oldest chunks", self.s.max_buffer_gb,
+                        freed / 1024 ** 3)
+        self.disk["recordings_gb"] = round(total / 1024 ** 3, 2)
+        return freed
+
+    def clean_clips(self) -> int:
+        """Posted clips' files go; clips not posted or approved within clip_keep_hours expire; past
+        max_clips_gb the oldest unposted clips expire first. Queued clips keep their files. Returns bytes freed."""
+        freed = sum(self.drop_clip_files(c) for c in self.db.clips_with_files(("posted",)))
+        now, keep = time.time(), self.s.clip_keep_hours * 3600
+        for c in self.db.clips_with_files(("pending", "failed")):  # oldest first
+            if not Path(c["path"]).exists():  # deleted outside the app: nothing left to review or post
+                self._expire(c, "video file is missing (deleted outside the app)")
+            elif now - max(c["created_at"] or 0, c["decided_at"] or 0) > keep:
+                freed += self._expire(c, f"not posted within {self.s.clip_keep_hours:g}h: video deleted to save space")
+        total = self._dir_bytes(Path(e.path) for e in os.scandir(self.clips_dir) if e.is_file())
+        for c in self.db.clips_with_files(("pending", "failed")):
+            if total <= self.s.max_clips_gb * 1024 ** 3:
+                break
+            got = self._expire(c, f"video deleted to keep clips under {self.s.max_clips_gb:g} GB")
+            total -= got
+            freed += got
+        self.disk["clips_gb"] = round(total / 1024 ** 3, 2)
+        return freed
+
+    def tidy_disk(self) -> int:
+        return self.enforce_buffer_cap() + self.clean_clips()
 
     def headline_writer(self) -> str:
         mode = self.s.headline_mode
@@ -336,57 +478,63 @@ class Pipeline:
         self.db.update_clip(clip_id, headline=text)
         return self.db.get_clip(clip_id)  # type: ignore[return-value]
 
-    def same_setup(self, accounts: str) -> bool:
-        """Was a clip posted through the current posting provider(s)? The daily cap mirrors the provider's own
-        limit (Upload-Post: 15 TikTok posts a day), so posts made through a provider no longer used don't count.
-        One provider: account ids have no 'provider/' prefix; several: every prefix is a current provider."""
-        names = self.s.poster_names()
-        ids = [a for a in (accounts or "").split(",") if a]
-        if len(names) == 1:
-            return all("/" not in a for a in ids)
-        return all(a.partition("/")[0] in names for a in ids)
-
     def cap_for(self, account: str) -> int:
-        return min(NETWORK_CAPS.get(network_of(account), self.s.max_posts_per_day), self.s.max_posts_per_day)
+        """Uploads `account` may get per rolling 24h."""
+        net = network_of(account)
+        own = {"tiktok": self.s.tiktok_per_day, "youtube": self.s.youtube_per_day}.get(net)
+        if own is not None:
+            return min(own, NETWORK_CAPS[net])
+        return min(NETWORK_CAPS.get(net, self.s.max_posts_per_day), self.s.max_posts_per_day)
 
-    def uploads_today(self) -> dict[str, int]:
-        """Uploads per account in the last 24h through the current setup. post_id holds one entry per upload:
-        'id' or 'version=id', with '@acct+acct' when it went to only some of the clip's accounts."""
-        used: dict[str, int] = {}
-        for r in self.db.posts_since(time.time() - 86400):
-            if not self.same_setup(r["accounts"]):
-                continue
-            accts = [a for a in (r["accounts"] or "").split(",") if a] or ["*"]  # no accounts yet: counts for all
-            for entry in (r["post_id"] or "").split(",") if r["post_id"] else [""]:
-                targets = entry.rsplit("@", 1)[1].split("+") if "@" in entry else accts
-                for a in targets:
-                    used[a] = used.get(a, 0) + 1
-        return used
+    def version_for(self, network: str) -> str:
+        """Posting all versions: the one this network gets, or 'all'."""
+        return {"tiktok": self.s.tiktok_version, "youtube": self.s.youtube_version}.get(network, "all")
 
-    def post_plan(self, clip: dict, version: str, accounts: list[str]) -> tuple[list[tuple[str, Path, list[str]]],
-                                                                               list[str]]:
-        """([(version, file, accounts)], [accounts skipped: daily cap]). Posting all versions, TikTok gets only
-        tiktok_version (unless that is 'all'); an account at its daily cap is left out, the others still post."""
-        files = self.posting_files(clip, version)
-        names = [n for n, _ in files]
-        tiktok_pick = self.s.tiktok_version if self.s.tiktok_version in names else names[0]
-        used = self.uploads_today()
-        plan, capped = [], []
-        for name, video in files:
-            targets = []
-            for a in accounts:
-                if (version == "all" and network_of(a) == "tiktok" and self.s.tiktok_version != "all"
-                        and name != tiktok_pick):
-                    continue
-                if used.get(a, 0) + used.get("*", 0) >= self.cap_for(a):
-                    if a not in capped:
-                        capped.append(a)
-                    continue
-                used[a] = used.get(a, 0) + 1
-                targets.append(a)
-            if targets:
-                plan.append((name, video, targets))
-        return plan, capped
+    def jobs_for(self, clip: dict, version: str, accounts: list[str]) -> list[tuple[str, str]]:
+        """[(version, account)]: one upload each. Posting 'all', each network gets its own pick."""
+        names = [n for n, _ in self.posting_files(clip, version)]
+        jobs = []
+        for a in accounts:
+            pick = self.version_for(network_of(a)) if version == "all" else "all"
+            wanted = names if pick == "all" else [pick if pick in names else names[0]]
+            jobs += [(n, a) for n in wanted]
+        return jobs
+
+    def slot_at(self, account: str, now: float | None = None) -> float:
+        """When `account` may get its next upload (<= now: right away): its daily allowance, the gap between
+        uploads, and a rest after a network turned an upload down for a daily limit."""
+        now = time.time() if now is None else now
+        rows = self.db.account_uploads_since(account, now - 86400)
+        counted = [u["sent_at"] for u in rows if u["state"] in COUNTED_STATES]
+        at, cap = 0.0, self.cap_for(account)
+        if len(counted) >= cap:  # full: free again when enough of the last 24h's uploads age out
+            at = counted[len(counted) - cap] + 86400
+        if counted:
+            at = max(at, counted[-1] + self.s.post_gap_min * 60)
+        limited = [u["sent_at"] for u in rows if u["state"] == "limited"]
+        if limited:
+            at = max(at, limited[-1] + LIMIT_BACKOFF_S)
+        return at
+
+    def posting_slots(self) -> list[dict]:
+        """Per default account: uploads in the last 24h, the allowance, and when the next one can go out."""
+        now = time.time()
+        out = []
+        for a in self.s.default_account_ids():
+            used = sum(u["state"] in COUNTED_STATES for u in self.db.account_uploads_since(a, now - 86400))
+            out.append({"account": a, "network": network_of(a), "used": used, "cap": self.cap_for(a),
+                        "next": max(self.slot_at(a, now), now)})
+        return out
+
+    @staticmethod
+    def rating(clip: dict) -> float:
+        return clip_rating(clip["score"], clip["audio_z"], clip["chat_z"])
+
+    @staticmethod
+    def remaining(clip: dict, uploads: list[dict]) -> list[tuple[str, str]]:
+        """Planned uploads not made yet (one turned down for a daily limit is still to do)."""
+        done = {(u["version"], u["account"]) for u in uploads if u["state"] != "limited"}
+        return [j for j in parse_plan(clip["plan"]) if j not in done]
 
     def should_auto_post(self, rating: float) -> bool:
         """auto_approve posts every clip; auto_post_min_rating > 0 posts the ones rated at least that."""
@@ -414,15 +562,24 @@ class Pipeline:
         cut = self.db.fail_interrupted_renders()
         if cut:
             log.warning("clips %s were rendering when the app stopped; marked failed", cut)
+        self.db.end_open_sessions()
+        freed = await asyncio.to_thread(self.sweep_recordings)
+        if freed:
+            log.warning("deleted %.1f GB of recordings left over from earlier runs", freed / 1024 ** 3)
+        cut_off = self.db.fail_interrupted_uploads()
+        if cut_off:
+            log.warning("clips %s were uploading when the app stopped; those uploads are marked failed", cut_off)
         self._watch_task = asyncio.create_task(self.watcher.run(lambda: self.s.poll_seconds))
+        self._queue_task = asyncio.create_task(self._housekeeping_loop())
 
     async def stop(self) -> None:
-        if self._watch_task:
-            self._watch_task.cancel()
-            try:
-                await self._watch_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._watch_task, self._queue_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         for w in list(self.workers.values()):
             w.request_stop()
         await self.wait_idle(timeout=900)  # the last clips (headline + three versions) take a few minutes each
@@ -477,6 +634,8 @@ class Pipeline:
         clip = self.db.get_clip(clip_id)
         if not clip:
             raise ClipError("clip not found")
+        if clip["status"] not in ("pending", "failed"):  # before the file check: a posted clip has no file left
+            raise ClipError(f"clip is {clip['status']}, cannot approve")
         if (on_screen is not None and version != "plain" and clip["status"] in ("pending", "failed")
                 and headline.clean(on_screen) != (clip.get("headline") or "")
                 and self.base_path(clip_id).exists()):
@@ -495,14 +654,13 @@ class Pipeline:
         accts = accounts if accounts is not None else self.s.default_account_ids()
         if not accts:
             raise ClipError("select at least one social account (or set default accounts in Settings)")
-        plan, capped = self.post_plan(clip, version, accts)
-        if not plan:
-            raise ClipError(f"daily post cap reached for {', '.join(network_of(a) for a in capped)}")
-        if not self.db.claim_clip(clip_id, ("pending", "failed"), "posting"):
+        jobs = self.jobs_for(clip, version, accts)
+        if not self.db.claim_clip(clip_id, ("pending", "failed"), "queued"):
             raise ClipError(f"clip is {clip['status']}, cannot approve")
         cap = caption if caption is not None and caption.strip() else (clip["caption"] or "")
-        self.db.update_clip(clip_id, caption=cap, accounts=",".join(accts), post_error="")
-        self._spawn(self._do_post(clip_id, plan, capped, named=version == "all"))
+        self.db.clear_failed_uploads(clip_id)
+        self.db.update_clip(clip_id, caption=cap, accounts=",".join(accts), post_error="", plan=format_plan(jobs))
+        self._spawn(self.run_queue())  # whatever has a free slot goes out now, the rest waits its turn
         return self.db.get_clip(clip_id)  # type: ignore[return-value]
 
     def posting_files(self, clip: dict, version: str) -> list[tuple[str, Path]]:
@@ -517,33 +675,102 @@ class Pipeline:
             out.append(("full", self.full_file(clip["id"])))
         return out
 
-    async def _do_post(self, clip_id: int, plan: list[tuple[str, Path, list[str]]], capped: list[str],
-                       named: bool = False) -> None:
-        """Post each planned version as its own post. Any success marks the clip posted (so a retry can't post
-        the ones that went out twice); failures and accounts left out (daily cap) are listed in post_error."""
-        clip = self.db.get_clip(clip_id)
-        everyone = clip["accounts"].split(",")
-        ids = []
-        errors = [f"{', '.join(network_of(a) for a in capped)}: daily cap reached, not posted there"] if capped else []
-        for name, video, targets in plan:
+    # ---- posting queue -------------------------------------------------
+    async def _housekeeping_loop(self) -> None:
+        """Every minute: post what has a free slot, check uploads, keep the disk within its limits."""
+        while True:
             try:
-                res = await self.poster.publish(video, clip["caption"], targets,
-                                                external_id=f"clip-{clip_id}-{name}" if named else f"clip-{clip_id}")
-                entry = f"{name}={res['post_id']}" if named else res["post_id"]
-                ids.append(entry + ("" if targets == everyone else "@" + "+".join(targets)))
-                if res.get("partial_error"):  # combined providers: some posted, some failed
-                    errors.append(f"{name}: {res['partial_error']}")
+                await self.check_uploads()
+            except Exception:
+                log.exception("posting queue pass failed")
+            try:
+                await asyncio.to_thread(self.tidy_disk)
+            except Exception:
+                log.exception("disk cleanup failed")
+            await asyncio.sleep(QUEUE_TICK_S)
+
+    async def run_queue(self) -> None:
+        """Send every queued upload whose account has a free slot (best-rated clips first), and settle the
+        clips that are done."""
+        async with self._queue_lock:
+            await self._settle()
+            clips = self.db.list_clips("queued", 500)
+            uploads = self.db.uploads_for_clips([c["id"] for c in clips])
+            wanting: dict[str, list[tuple[dict, str]]] = {}
+            for clip in sorted(clips, key=self.rating, reverse=True):
+                if time.time() - (clip["decided_at"] or 0) > self.s.queue_hours * 3600:
+                    continue  # waited too long: settled once its uploads in flight are answered
+                for version, account in self.remaining(clip, uploads[clip["id"]]):
+                    wanting.setdefault(account, []).append((clip, version))
+            for account, jobs in wanting.items():
+                for clip, version in jobs:
+                    if self.slot_at(account) > time.time():
+                        break
+                    await self._send(clip, version, account)
+            await self._settle()
+
+    async def _send(self, clip: dict, version: str, account: str) -> None:
+        uid = self.db.add_upload(clip["id"], version, account)
+        try:
+            res = await self.poster.publish(self.version_file(clip, version), clip["caption"], [account],
+                                            external_id=f"clip-{clip['id']}-{version}")
+            rid = str(res.get("post_id", ""))
+            self.db.update_upload(uid, request_id=rid, state="processing" if self.poster.checks(rid) else "live")
+        except Exception as e:
+            log.warning("uploading %s version of clip %s to %s failed: %s", version, clip["id"], account, e)
+            self.db.update_upload(uid, state="limited" if is_limit(str(e)) else "failed", error=str(e)[:300])
+
+    async def check_uploads(self) -> None:
+        """Ask the provider how the uploads it accepted ended, then run the queue."""
+        now = time.time()
+        for u in self.db.uploads_in("processing"):
+            if now - u["sent_at"] > CHECK_GIVE_UP_S:
+                self.db.update_upload(u["id"], state="failed", checked_at=now,
+                                      error="no answer from the network after 6 hours")
+                continue
+            try:
+                r = await self.poster.check(u["request_id"])
             except Exception as e:
-                log.exception("posting %s version of clip %s failed", name, clip_id)
-                errors.append(f"{name}: {e}" if named else str(e))
-        if not ids:
-            self.db.update_clip(clip_id, status="failed", post_error="; ".join(errors)[:300])
-            await self.notifier.notify_posted(clip, False, "; ".join(errors)[:150])
-            return
-        self.db.update_clip(clip_id, status="posted", post_id=",".join(ids), posted_at=time.time(),
-                            post_error="; ".join(errors)[:300])
-        where = ", ".join(f"{name} -> {'+'.join(network_of(a) for a in t)}" for name, _, t in plan)
-        await self.notifier.notify_posted(clip, not errors, (where + (f"; {'; '.join(errors)}" if errors else ""))[:300])
+                log.warning("checking upload %s failed: %s", u["id"], e)
+                continue
+            self.db.update_upload(u["id"], state=r["state"], url=r.get("url") or "", error=r.get("error") or "",
+                                  checked_at=now)
+        await self.run_queue()
+
+    async def _settle(self) -> None:
+        """Queued clips with nothing left to send (or that waited too long) and nothing in flight get their
+        final status: posted if anything went live, back to Review if it never got a slot, else failed."""
+        now = time.time()
+        for clip in self.db.list_clips("queued", 500):
+            ups = self.db.uploads_for(clip["id"])
+            left = self.remaining(clip, ups)
+            expired = now - (clip["decided_at"] or now) > self.s.queue_hours * 3600
+            if (left and not expired) or any(u["state"] in ("sending", "processing") for u in ups):
+                continue
+            await self._finish(clip, ups, left)
+
+    async def _finish(self, clip: dict, ups: list[dict], left: list[tuple[str, str]]) -> None:
+        cid = clip["id"]
+        live = [u for u in ups if u["state"] == "live"]
+        problems = [f"{network_of(u['account'])} {u['version']}: {u['error'] or 'failed'}"
+                    for u in ups if u["state"] == "failed"]
+        for version, account in left:
+            turned_down = [u for u in ups if u["state"] == "limited" and (u["version"], u["account"]) == (version, account)]
+            why = turned_down[-1]["error"] if turned_down else f"no free slot within {self.s.queue_hours:g}h"
+            problems.append(f"{network_of(account)} {version}: not posted ({why})")
+        err = "; ".join(problems)
+        if live:
+            self.db.update_clip(cid, status="posted", posted_at=min(u["sent_at"] for u in live),
+                                post_id=",".join(u["request_id"] for u in live), post_error=err[:300])
+            self.drop_clip_files(clip)  # it's up: nothing to keep locally
+            where = ", ".join(f"{network_of(u['account'])} ({u['version']}) {u['url']}".strip() for u in live)
+            await self.notifier.notify_posted(clip, True, (where + (f"; {err}" if err else ""))[:300])
+        elif left and not any(u["state"] == "failed" for u in ups):
+            self.db.update_clip(cid, status="pending", post_error=f"not posted: {err}. Approve it again to requeue"[:300])
+            await self.notifier.notify_posted(clip, False, f"back in Review: {err}"[:150])
+        else:
+            self.db.update_clip(cid, status="failed", post_error=(err or "nothing was posted")[:300])
+            await self.notifier.notify_posted(clip, False, (err or "nothing was posted")[:150])
 
     def reject(self, clip_id: int) -> dict:
         clip = self.db.get_clip(clip_id)
@@ -569,6 +796,7 @@ class Pipeline:
                          "chat": bool(w and w.chat and getattr(w.chat, "connected", False)),
                          "game": info.game, "auto": self.watcher.auto.get((plat, handle), "")})
         return {"live": live, "streamers": self.db.list_streamers(), "counts": self.db.counts(),
+                "slots": self.posting_slots() if not self.poster.manual else [], "disk": self.disk,
                 "configured": self.s.configured(), "poster": self.poster.info(),
                 "category_start_ts": parse_start(self.s.category_start), "watcher": {"last_poll": self.watcher.last_poll,
                                                                "errors": self.watcher.last_error}}

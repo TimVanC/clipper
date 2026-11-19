@@ -22,14 +22,30 @@ CREATE TABLE IF NOT EXISTS clips(
   post_id TEXT, post_error TEXT, created_at REAL, decided_at REAL, posted_at REAL);
 CREATE INDEX IF NOT EXISTS idx_clips_status ON clips(status);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS uploads(
+  id INTEGER PRIMARY KEY, clip_id INTEGER NOT NULL, version TEXT NOT NULL, account TEXT NOT NULL,
+  state TEXT NOT NULL, request_id TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT '', sent_at REAL NOT NULL, checked_at REAL);
+CREATE INDEX IF NOT EXISTS idx_uploads_clip ON uploads(clip_id);
+CREATE INDEX IF NOT EXISTS idx_uploads_account ON uploads(account, sent_at);
 """
 
 # columns added after the first release: headline = on-screen text burnt in at `seam` (pixel row);
-# the text-free render is kept next to the clip as <id>_base.mp4 so the headline can be changed
+# the text-free render is kept next to the clip as <id>_base.mp4 so the headline can be changed;
+# plan = the uploads an approved clip should get, "version>account,..."
 ADDED_COLUMNS = {"headline": "TEXT NOT NULL DEFAULT ''", "seam": "INTEGER NOT NULL DEFAULT 0",
-                 "transcript": "TEXT NOT NULL DEFAULT ''"}
+                 "transcript": "TEXT NOT NULL DEFAULT ''", "plan": "TEXT NOT NULL DEFAULT ''"}
 
-CLIP_STATUSES =("rendering", "pending", "posting", "posted", "approved", "failed", "rejected")
+# queued: approved, waiting for a free posting slot or for its uploads to be confirmed
+# expired: never posted or approved in time, its files were deleted to save disk space
+CLIP_STATUSES = ("rendering", "pending", "queued", "posting", "posted", "approved", "failed", "rejected",
+                 "expired")
+
+# one upload = one version of a clip to one account.
+# sending: being uploaded | processing: accepted, the network hasn't answered yet | live | failed |
+# limited: turned down by a daily limit (TikTok / YouTube / Upload-Post), tried again later
+UPLOAD_STATES = ("sending", "processing", "live", "failed", "limited")
+COUNTED_STATES = ("sending", "processing", "live")  # what uses up an account's daily allowance
 
 
 class Database:
@@ -95,6 +111,18 @@ class Database:
     def end_session(self, session_id: int) -> None:
         self._exec("UPDATE sessions SET ended_at=? WHERE id=?", (time.time(), session_id))
 
+    def end_open_sessions(self) -> list[int]:
+        """At startup nothing is recording: close the sessions a stopped app left open."""
+        ids = [r["id"] for r in self._all("SELECT id FROM sessions WHERE ended_at IS NULL")]
+        if ids:
+            self._exec(f"UPDATE sessions SET ended_at=? WHERE id IN ({','.join('?' * len(ids))})", (time.time(), *ids))
+        return ids
+
+    def clips_with_files(self, statuses: tuple[str, ...]) -> list[dict]:
+        marks = ",".join("?" * len(statuses))
+        return self._all(f"SELECT * FROM clips WHERE status IN ({marks}) AND path IS NOT NULL AND path!='' "
+                         "ORDER BY MAX(COALESCE(created_at,0), COALESCE(decided_at,0))", statuses)
+
     def list_sessions(self, limit: int = 20) -> list[dict]:
         return self._all("SELECT * FROM sessions ORDER BY id DESC LIMIT ?", (limit,))
 
@@ -120,7 +148,7 @@ class Database:
         if not fields:
             return
         allowed = {"path", "thumb", "status", "caption", "accounts", "post_id", "post_error",
-                   "decided_at", "posted_at", "headline", "seam", "transcript"}
+                   "decided_at", "posted_at", "headline", "seam", "transcript", "plan"}
         bad = set(fields) - allowed
         if bad:
             raise ValueError(f"cannot update {bad}")
@@ -143,10 +171,53 @@ class Database:
                         (since_ts,))
         return int(row["n"]) if row else 0
 
-    def posts_since(self, since_ts: float) -> list[dict]:
-        """accounts + post_id of the clips posted (or posting) since since_ts, for the daily caps."""
-        return self._all("SELECT accounts, post_id FROM clips WHERE status IN ('posted','posting') AND decided_at>=?",
-                         (since_ts,))
+    # ---- uploads -------------------------------------------------
+    def add_upload(self, clip_id: int, version: str, account: str, state: str = "sending",
+                   sent_at: float | None = None, **fields: Any) -> int:
+        cur = self._exec("INSERT INTO uploads(clip_id, version, account, state, sent_at) VALUES(?,?,?,?,?)",
+                         (clip_id, version, account, state, time.time() if sent_at is None else sent_at))
+        uid = int(cur.lastrowid)
+        if fields:
+            self.update_upload(uid, **fields)
+        return uid
+
+    def update_upload(self, upload_id: int, **fields: Any) -> None:
+        bad = set(fields) - {"state", "request_id", "url", "error", "checked_at"}
+        if bad:
+            raise ValueError(f"cannot update {bad}")
+        if "state" in fields and fields["state"] not in UPLOAD_STATES:
+            raise ValueError("bad upload state")
+        sets = ", ".join(f"{k}=?" for k in fields)
+        self._exec(f"UPDATE uploads SET {sets} WHERE id=?", (*fields.values(), upload_id))
+
+    def uploads_for(self, clip_id: int) -> list[dict]:
+        return self._all("SELECT * FROM uploads WHERE clip_id=? ORDER BY id", (clip_id,))
+
+    def uploads_for_clips(self, clip_ids: list[int]) -> dict[int, list[dict]]:
+        out: dict[int, list[dict]] = {i: [] for i in clip_ids}
+        if clip_ids:
+            for u in self._all(f"SELECT * FROM uploads WHERE clip_id IN ({','.join('?' * len(clip_ids))}) "
+                               "ORDER BY id", clip_ids):
+                out[u["clip_id"]].append(u)
+        return out
+
+    def uploads_in(self, *states: str) -> list[dict]:
+        return self._all(f"SELECT * FROM uploads WHERE state IN ({','.join('?' * len(states))}) ORDER BY id", states)
+
+    def account_uploads_since(self, account: str, since_ts: float) -> list[dict]:
+        return self._all("SELECT * FROM uploads WHERE account=? AND sent_at>=? ORDER BY sent_at", (account, since_ts))
+
+    def clear_failed_uploads(self, clip_id: int) -> None:
+        """Before a retry: the failed attempts make way for new ones."""
+        self._exec("DELETE FROM uploads WHERE clip_id=? AND state IN ('failed','limited')", (clip_id,))
+
+    def fail_interrupted_uploads(self) -> list[int]:
+        """Uploads the app was in the middle of sending when it stopped: whether they arrived is unknown."""
+        rows = self.uploads_in("sending")
+        for u in rows:
+            self.update_upload(u["id"], state="failed", error="the app was stopped while uploading: check the "
+                                                              "profile before retrying, it may be up already")
+        return [u["clip_id"] for u in rows]
 
     def fail_interrupted_posts(self) -> list[int]:
         """Clips left in 'posting' by a stopped app. They may have reached some networks, so they become

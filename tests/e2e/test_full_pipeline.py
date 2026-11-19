@@ -98,11 +98,11 @@ async def test_stream_to_clip_to_approved_post(synthetic_mp4, settings):
 
     # 5. Post for Me got the real file bytes and the post request
     assert upload.calls[0].request.content[:4] != b"" and len(upload.calls[0].request.content) == len(vid.content)
-    body = json.loads(post.calls[0].request.content)
-    assert body == {"caption": "GTA 6 chaos", "social_accounts": ["spc_1", "spc_2"],
-                    "media": [{"url": "https://cdn.example/clip.mp4"}], "external_id": f"clip-{clip['id']}"}
+    bodies = [json.loads(c.request.content) for c in post.calls]  # one post per account
+    assert bodies == [{"caption": "GTA 6 chaos", "social_accounts": [a], "media": [{"url": "https://cdn.example/clip.mp4"}],
+                       "external_id": f"clip-{clip['id']}-headline"} for a in ("spc_1", "spc_2")]
     final = db.get_clip(clip["id"])
-    assert final["status"] == "posted" and final["post_id"] == "sp_42"
+    assert final["status"] == "posted" and final["post_id"] == "sp_42,sp_42"
     assert any(b"Posted" in c.request.content for c in discord.calls)
 
     # 6. the watcher re-detects the same streamer if recording ended on its own and they're still live

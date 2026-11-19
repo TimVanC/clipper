@@ -112,7 +112,7 @@ async def test_pipeline_partial_failure_is_posted_with_error_and_not_retryable(s
     cid = db.add_clip(db.start_session("twitch", "speed", "t", "1", str(tmp_path)), "twitch", "speed",
                       10, 80, 60, 5.5, 5.0, 3.0)
     db.update_clip(cid, status="pending", path=str(video), thumb="", caption="cap")
-    assert (await pl.approve(cid))["status"] == "posting"
+    assert (await pl.approve(cid))["status"] == "queued"
     await pl.wait_idle()
     clip = db.get_clip(cid)
     assert clip["status"] == "posted" and clip["post_id"] == "postproxy:xyz"

@@ -8,6 +8,9 @@ Verified against the docs (2026-11):
   `youtube_description` (falls back to `description`), `tags[]` (YouTube tags). TikTok's caption is its
   title field; `description` is only used by YouTube, LinkedIn, Facebook and Pinterest. Sync answer: {"success", "results": {platform: {"success", "error"}}};
   async answer: {"success", "request_id"}.
+- GET  /api/uploadposts/status?request_id= -> {"status", "results": [{"platform", "success", "post_url",
+  "error_code", "error_message", ...}]}. An accepted async upload can still be turned down by the network
+  afterwards (YouTube's per-channel daily limit, TikTok's spam limit), so check() reads this.
 
 Upload-Post has no per-account id: an upload targets a profile (`user`) plus platform names. Account ids
 here are therefore "<profile>:<platform>", and publish() sends one upload per profile.
@@ -17,10 +20,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..captions import for_platform
-from .base import Poster, PosterError
+from .base import Poster, PosterError, first_sentence, is_limit
 
 PATH_USERS = "/api/uploadposts/users"
 PATH_UPLOAD = "/api/upload"
+PATH_STATUS = "/api/uploadposts/status"
 # platforms with a documented `<platform>_title` override
 TITLE_OVERRIDES = {"tiktok", "instagram", "youtube", "linkedin", "facebook", "x", "pinterest", "bluesky", "threads",
                    "reddit"}
@@ -99,3 +103,22 @@ class UploadPost(Poster):
             ids.append(str(j.get("request_id") or j.get("job_id") or ""))
             raw.append(j)
         return {"post_id": ",".join(i for i in ids if i), "raw": raw}
+
+    def checks(self, post_id: str) -> bool:
+        return bool(post_id) and "," not in post_id
+
+    async def check(self, post_id: str) -> dict:
+        r = await self.http.get(self.base + PATH_STATUS, params={"request_id": post_id}, headers=self._h())
+        j = self._check(r, f"GET {PATH_STATUS}")
+        results = [x for x in j.get("results") or [] if isinstance(x, dict)]
+        done = str(j.get("status", "")).lower() in ("completed", "failed", "error")
+        if not results or (not done and not any(x.get("success") is not None for x in results)):
+            return {"state": "processing", "url": "", "error": ""}
+        x = results[0]
+        if x.get("success"):
+            return {"state": "live", "url": x.get("post_url") or "", "error": ""}
+        if x.get("success") is None and not done:
+            return {"state": "processing", "url": "", "error": ""}
+        msg = x.get("error_message") or x.get("error") or "failed"
+        return {"state": "limited" if is_limit(msg, x.get("error_code") or "") else "failed", "url": "",
+                "error": first_sentence(msg)}

@@ -100,6 +100,10 @@ TUNABLES: dict[str, tuple[type, float | None, float | None]] = {
     "chat_weight": (float, 0, 10),
     "chat_delay_s": (float, 0, 60),
     "max_posts_per_day": (int, 1, 500),
+    "tiktok_per_day": (int, 1, 15),
+    "youtube_per_day": (int, 1, 30),
+    "post_gap_min": (float, 0, 1440),
+    "queue_hours": (float, 0.5, 72),
     "layout": (str, None, None),
     "facecam_boxes": (str, None, None),
     "watch_categories": (str, None, None),
@@ -113,8 +117,12 @@ TUNABLES: dict[str, tuple[type, float | None, float | None]] = {
     "auto_post_min_rating": (float, 0, 10),
     "auto_post_version": (str, None, None),
     "tiktok_version": (str, None, None),
+    "youtube_version": (str, None, None),
     "full_frame_version": (bool, None, None),
     "delete_raw": (bool, None, None),
+    "max_buffer_gb": (float, 0.5, 2000),
+    "clip_keep_hours": (float, 1, 720),
+    "max_clips_gb": (float, 0.5, 2000),
     "default_accounts": (str, None, None),
     "caption_template": (str, None, None),
     "caption_hooks": (str, None, None),
@@ -154,7 +162,7 @@ class Settings:
     # tunables
     poll_seconds: int = 120
     offline_grace_polls: int = 2
-    chunk_seconds: int = 600
+    chunk_seconds: int = 30  # short chunks: only the last few minutes of a stream are ever on disk
     pre_roll_s: float = 40.0
     post_roll_s: float = 15.0
     max_clip_s: float = 90.0
@@ -166,8 +174,14 @@ class Settings:
     audio_weight: float = 1.0
     chat_weight: float = 1.5
     chat_delay_s: float = 8.0
-    # uploads per social account per rolling 24h; each network's own cap (TikTok 15, YouTube 30...) still applies
+    # uploads per social account per rolling 24h, for networks without their own setting below
     max_posts_per_day: int = 30
+    # what TikTok / YouTube really let through: TikTok stops showing (then blocks) API posts past a handful a
+    # day, and a YouTube channel turns uploads down past its own daily limit (about 10 for this channel)
+    tiktok_per_day: int = 6
+    youtube_per_day: int = 10
+    post_gap_min: float = 60.0   # at least this long between two uploads to the same account
+    queue_hours: float = 12.0    # an approved clip waits this long for a free slot, then goes back to Review
     # auto: facecam on top + game below while a game is played and a cam is found, blur otherwise
     layout: str = "auto"
     facecam_boxes: str = ""         # "handle=x,y,w,h; ..." pins a streamer's cam (fractions of the frame)
@@ -185,10 +199,15 @@ class Settings:
     auto_approve: bool = False
     auto_post_min_rating: float = 0.0  # > 0: post clips rated at least this (0-10) without review
     auto_post_version: str = "headline"  # which version auto-posting uses: headline | plain | full | all
-    # when posting all versions: the one TikTok gets (its 15 posts a day go further), or all
+    # when posting all versions: the one each network gets (headline, plain, full), or all of them
     tiktok_version: str = "headline"
-    full_frame_version: bool = True      # also render the full-frame version of each clip (one more render)
-    delete_raw: bool = True
+    youtube_version: str = "headline"
+    # also render the full-frame version of a clip, when a network posts it (tiktok/youtube/auto_post_version)
+    full_frame_version: bool = True
+    delete_raw: bool = True              # drop recorded chunks once no clip can need them (rolling buffer)
+    max_buffer_gb: float = 5.0           # all recordings together never take more than this
+    clip_keep_hours: float = 12.0        # clip files not posted or approved by then are deleted ('expired')
+    max_clips_gb: float = 5.0            # clip files together never take more than this (oldest unposted go first)
     default_accounts: str = ""
     # {hook} {hashtags} {name} {streamer} {game} {title} {platform}; see app/captions.py
     caption_template: str = captions.DEFAULT_TEMPLATE
@@ -257,7 +276,7 @@ class Settings:
                 parse_categories(val)
             if k == "category_start":
                 parse_start(val)
-            if k in ("auto_post_version", "tiktok_version") and val not in ("headline", "plain", "full", "all"):
+            if k in ("auto_post_version", "tiktok_version", "youtube_version") and val not in ("headline", "plain", "full", "all"):
                 raise ValueError(f"{k} must be headline, plain, full or all")
             if k == "headline_mode" and val not in HEADLINE_MODES:
                 raise ValueError(f"headline_mode must be one of {', '.join(HEADLINE_MODES)}")

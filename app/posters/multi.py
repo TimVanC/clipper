@@ -47,6 +47,18 @@ class MultiPoster(Poster):
             raise PosterError("; ".join(errors)[:300])
         return out
 
+    def _owner(self, post_id: str) -> tuple[Poster | None, str]:
+        name, _, rest = post_id.partition(":")  # publish() returns "<provider>:<id>"
+        return self.by_name.get(name), rest
+
+    def checks(self, post_id: str) -> bool:
+        p, rest = self._owner(post_id)
+        return bool(p and p.checks(rest))
+
+    async def check(self, post_id: str) -> dict:
+        p, rest = self._owner(post_id)
+        return await p.check(rest) if p else await super().check(post_id)
+
     async def publish(self, path: Path, caption: str, account_ids: list[str], external_id: str | None = None) -> dict:
         groups: dict[str, list[str]] = {}
         for a in account_ids:

@@ -72,10 +72,12 @@ async def test_approve_posts_through_post_for_me(env):
     pl, c, cid = env
     post = mock_pfm()
     r = await c.post(f"/api/clips/{cid}/approve", json={"caption": "my caption", "accounts": ["spc_9"]})
-    assert r.status_code == 200 and r.json()["status"] == "posting"
+    assert r.status_code == 200 and r.json()["status"] == "queued"
     await pl.wait_idle()
     clip = pl.db.get_clip(cid)
     assert clip["status"] == "posted" and clip["post_id"] == "sp_1" and clip["caption"] == "my caption"
+    listed = (await c.get("/api/clips")).json()[0]["uploads"]
+    assert [(u["network"], u["version"], u["state"]) for u in listed] == [("spc_9", "headline", "live")]
     body = json.loads(post.calls[0].request.content)
     assert body["social_accounts"] == ["spc_9"] and body["media"] == [{"url": "https://cdn.example/v.mp4"}]
     # second approve is refused (no double posting)
@@ -105,15 +107,10 @@ async def test_approve_guards(env):
     r = await c.post(f"/api/clips/{cid}/approve", json={})
     assert r.status_code == 400 and "account" in r.json()["detail"]
     assert (await c.post("/api/clips/999/approve", json={"accounts": ["a"]})).status_code == 400
-    pl.s.max_posts_per_day = 1
-    assert pl.db.claim_clip(cid, ("pending",), "posting")  # one already used today
     other = pl.db.add_clip(1, "twitch", "x", 0, 30, 20, 4, 4, 0)
     pl.db.update_clip(other, status="pending")           # but this one has no video yet
     r = await c.post(f"/api/clips/{other}/approve", json={"accounts": ["a"]})
     assert r.status_code == 400 and "no video" in r.json()["detail"]
-    pl.db.update_clip(other, path=pl.db.get_clip(cid)["path"])
-    r = await c.post(f"/api/clips/{other}/approve", json={"accounts": ["a"]})
-    assert r.status_code == 400 and "cap" in r.json()["detail"]
     pl.poster.key = ""
     assert "not configured" in (await c.post(f"/api/clips/{other}/approve", json={"accounts": ["a"]})).json()["detail"]
 

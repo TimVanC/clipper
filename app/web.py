@@ -96,7 +96,8 @@ def create_app(pl: Pipeline, start_pipeline: bool = True) -> FastAPI:
     @app.get("/api/clips", dependencies=[Depends(auth)])
     async def clips(status: str | None = None, limit: int = 100) -> list[dict]:
         rows = pl.db.list_clips(status, min(limit, 500))
-        return [_public(r) for r in rows]
+        ups = pl.db.uploads_for_clips([r["id"] for r in rows])
+        return [_public(r, ups[r["id"]]) for r in rows]
 
     @app.post("/api/clips/{cid}/approve", dependencies=[Depends(auth)])
     async def approve(cid: int, body: ApproveIn) -> dict:
@@ -169,11 +170,18 @@ def create_app(pl: Pipeline, start_pipeline: bool = True) -> FastAPI:
     return app
 
 
-def _public(c: dict) -> dict:
+def _upload_public(u: dict) -> dict:
+    net = u["account"].rsplit(":", 1)[-1].rsplit("/", 1)[-1]
+    return {"network": net, "version": u["version"], "state": u["state"], "url": u["url"], "error": u["error"],
+            "sent_at": u["sent_at"]}
+
+
+def _public(c: dict, uploads: list[dict] | None = None) -> dict:
     r = clip_rating(c.get("score"), c.get("audio_z"), c.get("chat_z"))
     base = Path(c["path"]).with_name(f"{c['id']}_base.mp4") if c.get("path") else None
     return {k: v for k, v in c.items() if k not in ("path", "thumb", "transcript")} | {
         "has_video": bool(c.get("path")), "has_thumb": bool(c.get("thumb")),
         "has_plain": bool(base and base.exists() and c.get("headline")),
         "has_full": bool(base and base.with_name(f"{c['id']}_full.mp4").exists()),
-        "rating": r, "rating_label": rating_label(r)}
+        "rating": r, "rating_label": rating_label(r),
+        "uploads": [_upload_public(u) for u in uploads or []]}
